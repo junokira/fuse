@@ -366,7 +366,7 @@ function FeedScreen({
   const [images, setImages] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
 
-  const score = useCallback((s: State, p: Post) => {
+  const score = useCallback((_s: State, p: Post) => {
     const ageH = (Date.now() - p.createdAt) / 3_600_000;
     const engagement = p.likes * 2 + p.recasts * 3 + p.comments;
     return engagement + clamp(12 - ageH, 0, 12);
@@ -596,7 +596,6 @@ function ProfileScreen({
   setState,
   userId,
   onBack,
-  onOpenProfile,
 }: {
   state: State;
   setState: React.Dispatch<React.SetStateAction<State>>;
@@ -887,7 +886,6 @@ function StoriesTray({
 function PostCard({
   post,
   user,
-  me,
   liked,
   recasted,
   onToggle,
@@ -1078,7 +1076,6 @@ function runSelfTests() {
       createdAt: Date.now(),
     };
     const b: Post = { ...a, id: "b", likes: 10 };
-    const s = { ...SEED } as State;
     const scoreFn = (p: Post) => {
       const ageH = (Date.now() - p.createdAt) / 3_600_000;
       const engagement = p.likes * 2 + p.recasts * 3 + p.comments;
