@@ -684,10 +684,6 @@ function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, follow
               </button>
             </div>
           </div>
-        ) : (
-          <div className="mt-4 space-y-3">
-            <div className="text-sm text-zinc-500 mb-1">You are currently editing your profile, no changes have been saved yet.</div>
-          </div>
         )}
       </div>
 
@@ -758,6 +754,7 @@ function StoriesTray({ stories, users, me, onOpenProfile }: { stories: Story[]; 
         <button key={s.id} className="text-center flex-shrink-0" onClick={() => onOpenProfile(s.userId)} aria-label={`Open ${users[s.userId]?.name || "user"} profile`}>
           <div className="w-[70px] h-[70px] rounded-full p-[3px] bg-gradient-to-tr from-emerald-400 via-blue-400 to-pink-400">
             <div className="w-full h-full rounded-full bg-white dark:bg-zinc-950 border-2 border-white dark:border-zinc-950 overflow-hidden grid place-items-center">
+              {/* @ts-ignore */}
               {s.media_url ? <img src={s.media_url} alt="story" className="w-full h-full object-cover" loading="lazy" /> : <span className="text-xl">{(users[s.userId]?.name || "U")[0]}</span>}
             </div>
           </div>
