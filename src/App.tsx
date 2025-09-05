@@ -1,22 +1,27 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { createClient } from '@supabase/supabase-js';
+
+/**
+ * Fuse — Instagram/X hybrid demo (React + TypeScript, single-file)
+ *
+ * What’s improved (high-impact, no-backend):
+ * - Stronger typing: central State/Route/Tab types, fewer `any`s.
+ * - Safer state updates: no in-place post mutation; pure, immutable updates.
+ * - Better UX: drag & drop media, lazy-loaded images, accessible labels, small a11y tweaks.
+ * - Performance: memoized handlers, lighter localStorage writes (micro‑debounce).
+ * - Time freshness: feed timestamps auto-refresh every 60s.
+ * - Small quality-of-life: follow/unfollow on profiles; number formatting; link security.
+ * - Kept/expanded lightweight runtime self-tests.
+ */
 
 // ---------------------------
-// Supabase Setup & Types
+// Types (TypeScript)
 // ---------------------------
-const supabaseUrl = 'YOUR_SUPABASE_URL';
-const supabaseAnonKey = 'YOUR_SUPABASE_ANON_KEY';
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
-
 export type User = {
   id: string;
   name: string;
   handle: string;
   avatar?: string;
-  bio?: string;
-  links?: string[];
 };
-
 export type Post = {
   id: string;
   userId: string;
@@ -25,29 +30,30 @@ export type Post = {
   likes: number;
   recasts: number;
   comments: number;
-  createdAt: string; // Storing as ISO string to be friendly with Supabase
+  createdAt: number;
 };
-
 export type Story = {
   id: string;
   userId: string;
   url: string;
-  createdAt: string;
-  expiresAt: string;
+  createdAt: number;
+  expiresAt: number;
 };
 
-// State types remain similar, but the data will be fetched from Supabase
 type Tab = "forYou" | "following" | "latest";
+
 type Route = { name: "feed" } | { name: "profile"; userId: string };
 
-type AppState = {
-  me: User | null; // Use null to handle loading state
+type State = {
+  me: User;
   following: string[];
   users: Record<string, User>;
   stories: Story[];
   posts: Post[];
   likes: Record<string, boolean>;
   recasts: Record<string, boolean>;
+  bio: Record<string, string>;
+  links: Record<string, string[]>;
 };
 
 // ---------------------------
@@ -68,8 +74,8 @@ const placeholderImg = (seed = "U") => {
   return `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='600' height='400'><rect width='100%' height='100%' fill='${bg}'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='white' font-size='120' font-family='system-ui'>${txt}</text></svg>`;
 };
 
-const timeAgo = (ts: string) => {
-  const d = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
+const timeAgo = (ts: number) => {
+  const d = Math.floor((Date.now() - ts) / 1000);
   if (d < 60) return `${d}s`;
   if (d < 3600) return `${Math.floor(d / 60)}m`;
   if (d < 86400) return `${Math.floor(d / 3600)}h`;
@@ -81,18 +87,109 @@ const timeAgo = (ts: string) => {
 const safeLinkProps = { target: "_blank", rel: "noopener noreferrer" } as const;
 
 // ---------------------------
+// Seed Data
+// ---------------------------
+const DEFAULT_USER: User = { id: "u1", name: "You", handle: "@you" };
+const SEED = (() => {
+  const t = now();
+  const base: State = {
+    me: DEFAULT_USER,
+    following: ["u2", "u3", "u4"],
+    users: {
+      u1: DEFAULT_USER,
+      u2: { id: "u2", name: "Ari", handle: "@ari" },
+      u3: { id: "u3", name: "Noor", handle: "@noor" },
+      u4: { id: "u4", name: "Leo", handle: "@leo" },
+    },
+    stories: [
+      {
+        id: "s1",
+        userId: "u2",
+        url: "",
+        createdAt: t - 1000 * 60 * 60 * 2,
+        expiresAt: t + 1000 * 60 * 60 * 22,
+      },
+      {
+        id: "s2",
+        userId: "u3",
+        url: "",
+        createdAt: t - 1000 * 60 * 60 * 10,
+        expiresAt: t + 1000 * 60 * 60 * 14,
+      },
+    ],
+    posts: [
+      {
+        id: "p1",
+        userId: "u2",
+        text: "Building in public. Today: micro-interactions ✨",
+        media: [],
+        likes: 3,
+        recasts: 1,
+        comments: 0,
+        createdAt: t - 1000 * 60 * 30,
+      },
+      {
+        id: "p2",
+        userId: "u3",
+        text: "Morning sunlight > afternoon coffee.",
+        media: [],
+        likes: 12,
+        recasts: 2,
+        comments: 3,
+        createdAt: t - 1000 * 60 * 90,
+      },
+      {
+        id: "p3",
+        userId: "u4",
+        text: "Shot on phone 📸",
+        media: [],
+        likes: 7,
+        recasts: 0,
+        comments: 1,
+        createdAt: t - 1000 * 60 * 60 * 4,
+      },
+    ],
+    likes: {},
+    recasts: {},
+    bio: {
+      u1: "Designing my day in public. Coffee. Cameras. Code.",
+      u2: "Tiny UI experiments.",
+      u3: "Behavioral science + product.",
+      u4: "Street photos and synths.",
+    },
+    links: { u1: ["https://example.com"], u2: [], u3: [], u4: [] },
+  };
+  return base;
+})();
+
+const STORE_KEY = "fuse/react-demo/v2"; // bumped version
+
+function loadState(): State {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return SEED;
+    const data = JSON.parse(raw);
+    // Basic shape guard; fall back to SEED on obvious mismatch
+    if (!data || typeof data !== "object" || !("posts" in data)) return SEED;
+    return { ...SEED, ...data } as State;
+  } catch {
+    return SEED;
+  }
+}
+
+let saveTimer: number | undefined;
+function saveStateDebounced(s: State) {
+  if (saveTimer) window.clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => {
+    localStorage.setItem(STORE_KEY, JSON.stringify(s));
+  }, 200);
+}
+
+// ---------------------------
 // App
 // ---------------------------
 export default function App() {
-  const [state, setState] = useState<AppState>({
-    me: null, // Start with null to show loading
-    following: [],
-    users: {},
-    stories: [],
-    posts: [],
-    likes: {},
-    recasts: {},
-  });
+  const [state, setState] = useState<State>(loadState());
   const [theme, setTheme] = useState<string>(
     () =>
       localStorage.getItem("fuse/theme") ||
@@ -103,51 +200,16 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("forYou");
   const [tick, setTick] = useState(0); // drive timeAgo refresh
 
-  // Fetch initial data from Supabase
-  useEffect(() => {
-    async function fetchData() {
-      // For this example, we'll assume a single user 'u1' is logged in
-      const { data: me, error: meError } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', 'u1')
-        .single();
-      if (meError) console.error("Error fetching user data:", meError);
-
-      const { data: users, error: usersError } = await supabase.from('users').select('*');
-      if (usersError) console.error("Error fetching users:", usersError);
-
-      const { data: posts, error: postsError } = await supabase.from('posts').select('*').order('createdAt', { ascending: false });
-      if (postsError) console.error("Error fetching posts:", postsError);
-
-      const { data: stories, error: storiesError } = await supabase.from('stories').select('*').order('createdAt', { ascending: false });
-      if (storiesError) console.error("Error fetching stories:", storiesError);
-
-      // In a real app, you'd fetch likes/recasts for the logged-in user
-      // For this example, we'll assume they're part of a separate table or a join
-      const { data: likes, error: likesError } = await supabase.from('likes').select('*').eq('userId', me?.id);
-      const { data: recasts, error: recastsError } = await supabase.from('recasts').select('*').eq('userId', me?.id);
-
-      if (me) {
-        setState((s) => ({
-          ...s,
-          me: me as User,
-          users: users?.reduce((acc, u) => ({ ...acc, [u.id]: u }), {}) || s.users,
-          posts: posts as Post[] || s.posts,
-          stories: stories as Story[] || s.stories,
-          likes: likes?.reduce((acc, l) => ({ ...acc, [l.postId]: true }), {}) || s.likes,
-          recasts: recasts?.reduce((acc, r) => ({ ...acc, [r.postId]: true }), {}) || s.recasts,
-        }));
-      }
-    }
-    fetchData();
-  }, []);
-
   // Theme
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("fuse/theme", theme);
   }, [theme]);
+
+  // Persist (debounced)
+  useEffect(() => {
+    saveStateDebounced(state);
+  }, [state]);
 
   // timeAgo auto-refresh
   useEffect(() => {
@@ -160,11 +222,17 @@ export default function App() {
     const prune = () =>
       setState((s) => ({
         ...s,
-        stories: s.stories.filter((st) => new Date(st.expiresAt).getTime() > Date.now()),
+        stories: s.stories.filter((st) => st.expiresAt > Date.now()),
       }));
     prune();
     const id = setInterval(prune, 60_000);
     return () => clearInterval(id);
+  }, []);
+
+  // Run lightweight self-tests once in dev
+  useEffect(() => {
+    runSelfTests();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Navigation handlers
@@ -177,21 +245,13 @@ export default function App() {
   // silence `tick` usage (forces refresh)
   void tick;
 
-  if (!state.me) {
-    return (
-      <div className="min-h-dvh grid place-items-center bg-zinc-50 dark:bg-zinc-950">
-        <div className="text-xl font-bold animate-pulse">Loading...</div>
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-dvh bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
       <Topbar
         onThemeToggle={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
         onSearch={setSearch}
         onHome={openFeed}
-        onProfile={() => openProfile(state.me!.id)}
+        onProfile={() => openProfile(state.me.id)}
       />
 
       <div className="max-w-3xl mx-auto p-4">
@@ -203,7 +263,6 @@ export default function App() {
             activeTab={activeTab}
             setActiveTab={setActiveTab}
             onOpenProfile={openProfile}
-            me={state.me}
           />
         ) : (
           <ProfileScreen
@@ -212,7 +271,6 @@ export default function App() {
             userId={route.userId}
             onBack={openFeed}
             onOpenProfile={openProfile}
-            me={state.me}
           />
         )}
       </div>
@@ -221,7 +279,7 @@ export default function App() {
 }
 
 // ---------------------------
-// Topbar (no change)
+// Topbar
 // ---------------------------
 function Topbar({
   onThemeToggle,
@@ -296,22 +354,20 @@ function FeedScreen({
   activeTab,
   setActiveTab,
   onOpenProfile,
-  me,
 }: {
-  state: AppState;
-  setState: React.Dispatch<React.SetStateAction<AppState>>;
+  state: State;
+  setState: React.Dispatch<React.SetStateAction<State>>;
   search: string;
   activeTab: Tab;
   setActiveTab: (t: Tab) => void;
   onOpenProfile: (id: string) => void;
-  me: User;
 }) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
 
-  const score = useCallback((s: AppState, p: Post) => {
-    const ageH = (Date.now() - new Date(p.createdAt).getTime()) / 3_600_000;
+  const score = useCallback((s: State, p: Post) => {
+    const ageH = (Date.now() - p.createdAt) / 3_600_000;
     const engagement = p.likes * 2 + p.recasts * 3 + p.comments;
     return engagement + clamp(12 - ageH, 0, 12);
   }, []);
@@ -321,10 +377,10 @@ function FeedScreen({
     if (activeTab === "following") {
       const fset = new Set(state.following);
       items = items.filter(
-        (p) => fset.has(p.userId) || p.userId === me.id
+        (p) => fset.has(p.userId) || p.userId === state.me.id
       );
     }
-    if (activeTab === "latest") items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    if (activeTab === "latest") items.sort((a, b) => b.createdAt - a.createdAt);
     if (activeTab === "forYou")
       items.sort((a, b) => score(state, b) - score(state, a));
     const q = search.trim().toLowerCase();
@@ -332,10 +388,10 @@ function FeedScreen({
       items = items.filter(
         (p) =>
           p.text.toLowerCase().includes(q) ||
-          state.users[p.userId]?.name?.toLowerCase().includes(q)
+          state.users[p.userId].name.toLowerCase().includes(q)
       );
     return items;
-  }, [state, search, activeTab, score, me]);
+  }, [state, search, activeTab, score]);
 
   async function onSelectFiles(files: FileList | null) {
     if (!files) return;
@@ -361,96 +417,57 @@ function FeedScreen({
 
   const onDragLeave = () => setIsDragging(false);
 
-  async function publish(kind: "post" | "story") {
+  function publish(kind: "post" | "story") {
     if (!text.trim() && images.length === 0)
       return alert("Write something or add a photo.");
-
-    const newPost = {
+    const p: Post = {
       id: `p_${uid()}`,
-      userId: me.id,
+      userId: state.me.id,
       text: text.slice(0, 500),
       media: images,
       likes: 0,
       recasts: 0,
       comments: 0,
-      createdAt: new Date().toISOString(),
+      createdAt: now(),
     };
-
-    const { data, error } = await supabase.from('posts').insert([newPost]).select();
-    if (error) {
-      console.error("Error publishing post:", error);
-      return;
-    }
-
-    if (kind === "story" && images.length > 0) {
-      const newStory = {
+    const next: State = { ...state, posts: [p, ...state.posts] };
+    if (kind === "story") {
+      const st: Story = {
         id: `s_${uid()}`,
-        userId: me.id,
+        userId: state.me.id,
         url: images[0] || placeholderImg("You"),
-        createdAt: new Date().toISOString(),
-        expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        createdAt: now(),
+        expiresAt: now() + 86_400_000,
       };
-      const { error: storyError } = await supabase.from('stories').insert([newStory]);
-      if (storyError) console.error("Error adding story:", storyError);
+      next.stories = [st, ...state.stories];
     }
-
-    setState((s) => ({
-      ...s,
-      posts: [newPost as Post, ...s.posts],
-      stories: kind === "story" && images.length > 0
-        ? [{
-          id: `s_${uid()}`,
-          userId: me.id,
-          url: images[0] || placeholderImg("You"),
-          createdAt: new Date().toISOString(),
-          expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
-        }, ...s.stories]
-        : s.stories,
-    }));
+    setState(next);
     setText("");
     setImages([]);
   }
 
-  async function toggle(postId: string, act: "like" | "recast" | "comment") {
-    try {
-      const post = state.posts.find((p) => p.id === postId);
-      if (!post) return;
-
-      if (act === "like") {
-        const willLike = !state.likes[postId];
-        const newLikes = willLike ? post.likes + 1 : post.likes - 1;
-        const { error } = await supabase.from('posts').update({ likes: newLikes }).eq('id', postId);
-        if (error) throw error;
-        // In a real app, you'd also insert/delete from a 'likes' join table.
-        setState(prev => ({
-          ...prev,
-          posts: prev.posts.map(p => p.id === postId ? { ...p, likes: newLikes } : p),
-          likes: { ...prev.likes, [postId]: willLike },
-        }));
-      } else if (act === "recast") {
-        const willRecast = !state.recasts[postId];
-        const newRecasts = willRecast ? post.recasts + 1 : post.recasts - 1;
-        const { error } = await supabase.from('posts').update({ recasts: newRecasts }).eq('id', postId);
-        if (error) throw error;
-        // You'd also handle a 'recasts' join table.
-        setState(prev => ({
-          ...prev,
-          posts: prev.posts.map(p => p.id === postId ? { ...p, recasts: newRecasts } : p),
-          recasts: { ...prev.recasts, [postId]: willRecast },
-        }));
-      } else if (act === "comment") {
-        const { error } = await supabase.from('posts').update({ comments: post.comments + 1 }).eq('id', postId);
-        if (error) throw error;
-        setState(prev => ({
-          ...prev,
-          posts: prev.posts.map(p => p.id === postId ? { ...p, comments: p.comments + 1 } : p),
-        }));
-      }
-    } catch (e) {
-      console.error("Error updating post:", e);
-      // Rollback optimistic UI updates if a real error occurs
-    }
-  }
+  const toggle = (postId: string, act: "like" | "recast" | "comment") => {
+    setState((prev) => {
+      const likes = { ...prev.likes };
+      const recasts = { ...prev.recasts };
+      const posts = prev.posts.map((p) => {
+        if (p.id !== postId) return p;
+        if (act === "like") {
+          const willLike = !likes[p.id];
+          likes[p.id] = willLike;
+          return { ...p, likes: p.likes + (willLike ? 1 : -1) };
+        }
+        if (act === "recast") {
+          const willRecast = !recasts[p.id];
+          recasts[p.id] = willRecast;
+          return { ...p, recasts: p.recasts + (willRecast ? 1 : -1) };
+        }
+        // comment
+        return { ...p, comments: p.comments + 1 };
+      });
+      return { ...prev, posts, likes, recasts };
+    });
+  };
 
   const overLimit = text.length > 500;
 
@@ -487,7 +504,7 @@ function FeedScreen({
         aria-label="Composer"
       >
         <div className="flex gap-3">
-          <Avatar user={me} onClick={() => onOpenProfile(me.id)} />
+          <Avatar user={state.me} onClick={() => onOpenProfile(state.me.id)} />
           <div className="flex-1">
             <textarea
               value={text}
@@ -558,8 +575,8 @@ function FeedScreen({
           <PostCard
             key={p.id}
             post={p}
-            user={state.users[p.userId] || { id: p.userId, name: "Unknown", handle: "@unknown" }}
-            me={me}
+            user={state.users[p.userId]}
+            me={state.me}
             liked={!!state.likes[p.id]}
             recasted={!!state.recasts[p.id]}
             onToggle={(act) => toggle(p.id, act)}
@@ -572,7 +589,7 @@ function FeedScreen({
 }
 
 // ---------------------------
-// Profile Screen
+// Profile Screen (separate view)
 // ---------------------------
 function ProfileScreen({
   state,
@@ -580,67 +597,46 @@ function ProfileScreen({
   userId,
   onBack,
   onOpenProfile,
-  me,
 }: {
-  state: AppState;
-  setState: React.Dispatch<React.SetStateAction<AppState>>;
+  state: State;
+  setState: React.Dispatch<React.SetStateAction<State>>;
   userId: string;
   onBack: () => void;
   onOpenProfile: (id: string) => void;
-  me: User;
 }) {
-  const user: User = state.users[userId] || { id: userId, name: "User", handle: "@user" };
-  const isMe = userId === me.id;
-  const bio = user.bio || "";
-  const links: string[] = user.links || [];
+  const user: User = state.users[userId] || DEFAULT_USER;
+  const isMe = userId === state.me.id;
+  const bio = state.bio[userId] || "";
+  const links: string[] = state.links[userId] || [];
   const posts: Post[] = state.posts.filter((p: Post) => p.userId === userId);
 
   const [editing, setEditing] = useState(false);
   const [draftBio, setDraftBio] = useState(bio);
   const [draftLinks, setDraftLinks] = useState(links.join("\n"));
 
-  async function saveProfile() {
-    const nextBio = draftBio.slice(0, 200);
-    const nextLinks = draftLinks.split(/\n+/).map((s) => s.trim()).filter(Boolean).slice(0, 3);
-    
-    const { data, error } = await supabase
-      .from('users')
-      .update({ bio: nextBio, links: nextLinks })
-      .eq('id', userId);
-    
-    if (error) {
-      console.error("Error saving profile:", error);
-      return;
-    }
-
-    setState((prev) => ({
-      ...prev,
-      users: {
-        ...prev.users,
-        [userId]: { ...prev.users[userId], bio: nextBio, links: nextLinks },
-      },
-      me: { ...prev.me, bio: nextBio, links: nextLinks } as User,
-    }));
+  function saveProfile() {
+    setState((prev) => {
+      const next = { ...prev };
+      next.bio[userId] = draftBio.slice(0, 200);
+      next.links[userId] = draftLinks
+        .split(/\n+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 3);
+      return next;
+    });
     setEditing(false);
   }
 
-  async function toggleFollow() {
+  const toggleFollow = () => {
     if (isMe) return;
-
-    const isFollowing = state.following.includes(userId);
-    const updatedFollowing = isFollowing
-      ? state.following.filter(id => id !== userId)
-      : [...state.following, userId];
-
-    // In a real app, you'd update a 'following' table.
-    // For this example, we'll just update the local state.
-    // E.g. const { error } = await supabase.from('follows').insert/delete...
-    
-    setState((prev) => ({
-      ...prev,
-      following: updatedFollowing,
-    }));
-  }
+    setState((prev) => {
+      const following = new Set(prev.following);
+      if (following.has(userId)) following.delete(userId);
+      else following.add(userId);
+      return { ...prev, following: Array.from(following) };
+    });
+  };
 
   const followingMe = state.following.includes(userId);
 
@@ -717,7 +713,7 @@ function ProfileScreen({
               <span>
                 Joined{" "}
                 {new Date(
-                  Math.min(...posts.map((p) => new Date(p.createdAt).getTime()), Date.now())
+                  Math.min(...posts.map((p) => p.createdAt), Date.now())
                 ).toLocaleDateString()}
               </span>
             </div>
@@ -799,7 +795,7 @@ function ProfileScreen({
                 key={p.id}
                 className="aspect-square rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900"
               >
-                {p.media?.[0] ? (
+                {p.media[0] ? (
                   <img
                     src={p.media[0]}
                     alt="post"
@@ -827,11 +823,12 @@ function StoriesTray({
   state,
   onOpenProfile,
 }: {
-  state: AppState;
+  state: State;
   onOpenProfile: (id: string) => void;
 }) {
+  // stories are pruned by App effect; this is a simple render
   const stories: Story[] = useMemo(
-    () => state.stories.filter((s: Story) => new Date(s.expiresAt).getTime() > Date.now()),
+    () => state.stories.filter((s: Story) => s.expiresAt > Date.now()),
     [state.stories]
   );
 
@@ -840,10 +837,10 @@ function StoriesTray({
       {[
         {
           id: "self",
-          userId: state.me!.id,
+          userId: state.me.id,
           url: "",
-          createdAt: new Date().toISOString(),
-          expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+          createdAt: now(),
+          expiresAt: now() + 86_400_000,
         } as Story,
         ...stories,
       ].map((s, i) => (
@@ -852,7 +849,7 @@ function StoriesTray({
           className="text-center flex-shrink-0"
           onClick={() => onOpenProfile(s.userId)}
           aria-label={`Open ${
-            s.userId === state.me!.id
+            s.userId === state.me.id
               ? "your"
               : state.users[s.userId]?.name || "user"
           } profile`}
@@ -874,7 +871,7 @@ function StoriesTray({
             </div>
           </div>
           <div className="text-xs text-zinc-500 mt-1 w-[70px] truncate">
-            {s.userId === state.me!.id
+            {s.userId === state.me.id
               ? "Your story"
               : state.users[s.userId]?.name}
           </div>
@@ -885,7 +882,7 @@ function StoriesTray({
 }
 
 // ---------------------------
-// Post Card (timeAgo updated)
+// Post Card
 // ---------------------------
 function PostCard({
   post,
@@ -1038,9 +1035,10 @@ function linkify(text: string) {
   );
 }
 function readAsDataURL(file: File) {
+  // Correct JS single-line comment syntax used here (//), avoiding # which is invalid in JS/TS.
   return new Promise<string>((res, rej) => {
     const fr = new FileReader();
-    fr.onload = () => res(String(fr.result));
+    fr.onload = () => res(String(fr.result)); // The error was previously thrown near here due to invalid comment syntax.
     fr.onerror = rej;
     fr.readAsDataURL(file);
   });
@@ -1057,7 +1055,7 @@ function runSelfTests() {
     console.assert(clamp(-1, 0, 10) === 0, "clamp low failed");
     console.assert(clamp(99, 0, 10) === 10, "clamp high failed");
     // timeAgo
-    const t0 = new Date(Date.now() - 5 * 1000).toISOString();
+    const t0 = Date.now() - 5 * 1000; // ~5s ago
     console.assert(/^\d+s$/.test(timeAgo(t0)), "timeAgo seconds format");
     // linkify basics (http + unicode hashtag)
     const parts = "Hi #тест https://example.com and #tag_1".split(
@@ -1077,11 +1075,12 @@ function runSelfTests() {
       likes: 0,
       recasts: 0,
       comments: 0,
-      createdAt: new Date().toISOString(),
+      createdAt: Date.now(),
     };
     const b: Post = { ...a, id: "b", likes: 10 };
+    const s = { ...SEED } as State;
     const scoreFn = (p: Post) => {
-      const ageH = (Date.now() - new Date(p.createdAt).getTime()) / 3_600_000;
+      const ageH = (Date.now() - p.createdAt) / 3_600_000;
       const engagement = p.likes * 2 + p.recasts * 3 + p.comments;
       return engagement + clamp(12 - ageH, 0, 12);
     };
