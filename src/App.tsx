@@ -1,32 +1,57 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { supabase } from "./supabaseClient";
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, onAuthStateChanged, signInAnonymously } from 'firebase/auth';
+import { getFirestore, collection, doc, onSnapshot, getDoc, updateDoc, setDoc, getDocs, query, where, addDoc, deleteDoc } from 'firebase/firestore';
+
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// ---------------------------
+// Types
+// ---------------------------
+/**
+ * Represents a user profile.
+ * @typedef {object} User
+ * @property {string} id - The user's unique ID.
+ * @property {string} name - The user's display name.
+ * @property {string} handle - The user's handle (e.g., @johndoe).
+ * @property {string} [avatar] - The URL to the user's avatar image.
+ */
+export type User = { id: string; name: string; handle: string; avatar?: string };
 
 /**
- * Fuse — Instagram/X hybrid demo (React + Supabase, full-stack)
- *
- * This version replaces the local state with a Supabase backend for:
- * - User authentication
- * - Persistent posts, stories, and user data
- * - Real-time updates for new content
- * - File storage for media and avatars
+ * Represents a post.
+ * @typedef {object} Post
+ * @property {string} id - The post's unique ID.
+ * @property {string} userId - The ID of the user who created the post.
+ * @property {string} text - The content of the post.
+ * @property {string[]} media - An array of URLs to media attached to the post.
+ * @property {number} likes - The number of likes the post has.
+ * @property {number} recasts - The number of recasts the post has.
+ * @property {number} comments - The number of comments the post has.
+ * @property {string} createdAt - The creation timestamp of the post.
  */
-
-// ---------------------------
-// Types (TypeScript)
-// ---------------------------
-export type User = { id: string; name: string; handle: string; avatar?: string };
 export type Post = { id: string; userId: string; text: string; media: string[]; likes: number; recasts: number; comments: number; createdAt: string };
+
+/**
+ * Represents a story.
+ * @typedef {object} Story
+ * @property {string} id - The story's unique ID.
+ * @property {string} userId - The ID of the user who created the story.
+ * @property {string} url - The URL to the story's media.
+ * @property {string} createdAt - The creation timestamp of the story.
+ * @property {string} expiresAt - The expiration timestamp of the story.
+ */
 export type Story = { id: string; userId: string; url: string; createdAt: string; expiresAt: string };
 
 type Tab = "forYou" | "following" | "latest";
-
 type Route = { name: "feed" } | { name: "profile"; userId: string } | { name: "auth" };
 
 // ---------------------------
 // Helpers
 // ---------------------------
 const uid = () => (typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : Math.random().toString(36).slice(2, 10));
-const now = () => Date.now();
 const clamp = (n: number, min: number, max: number) => Math.min(Math.max(n, min), max);
 const formatCount = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : String(n));
 const placeholderImg = (seed = "U") => {
@@ -34,7 +59,6 @@ const placeholderImg = (seed = "U") => {
   const txt = encodeURIComponent(seed[0] || "U");
   return `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='600' height='400'><rect width='100%' height='100%' fill='${bg}'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='white' font-size='120' font-family='system-ui'>${txt}</text></svg>`;
 };
-
 const timeAgo = (ts: string) => {
   const d = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
   if (d < 60) return `${d}s`;
@@ -44,7 +68,6 @@ const timeAgo = (ts: string) => {
   if (days < 7) return `${days}d`;
   return new Date(ts).toLocaleDateString();
 };
-
 const safeLinkProps = { target: "_blank", rel: "noopener noreferrer" } as const;
 
 // ---------------------------
@@ -55,8 +78,6 @@ export default function App() {
   const [route, setRoute] = useState<Route>({ name: "feed" });
   const [search, setSearch] = useState("");
   const [activeTab, setActiveTab] = useState<Tab>("forYou");
-
-  const [session, setSession] = useState<any>(null);
   const [me, setMe] = useState<User | null>(null);
   const [allPosts, setAllPosts] = useState<Post[]>([]);
   const [allUsers, setAllUsers] = useState<Record<string, User>>({});
@@ -64,59 +85,116 @@ export default function App() {
   const [likes, setLikes] = useState<Record<string, boolean>>({});
   const [recasts, setRecasts] = useState<Record<string, boolean>>({});
   const [following, setFollowing] = useState<string[]>([]);
+  const [db, setDb] = useState<any>(null);
+  const [auth, setAuth] = useState<any>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
 
+  // Initialize Firebase and set up auth listener
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      if (session) {
-        fetchUserData(session.user.id);
-        fetchLikesAndRecasts(session.user.id);
-        fetchFollowing(session.user.id);
-      } else {
-        setRoute({ name: "auth" });
-      }
-    });
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+      setDb(firestore);
+      setAuth(firebaseAuth);
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session);
-      if (session) {
-        fetchUserData(session.user.id);
-        fetchLikesAndRecasts(session.user.id);
-        fetchFollowing(session.user.id);
-        setRoute({ name: "feed" });
-      } else {
-        setRoute({ name: "auth" });
-      }
-    });
-
-    return () => subscription.unsubscribe();
+      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          if (initialAuthToken) {
+            try {
+              await signInWithCustomToken(firebaseAuth, initialAuthToken);
+            } catch (e) {
+              console.error('Error with custom auth token:', e);
+            }
+          }
+          await fetchUserData(user.uid, firestore);
+          await fetchLikesAndRecasts(user.uid, firestore);
+          await fetchFollowing(user.uid, firestore);
+          setRoute({ name: "feed" });
+        } else {
+          // Sign in anonymously if no token is available
+          await signInAnonymously(firebaseAuth);
+        }
+        setIsAuthReady(true);
+      });
+      return () => unsubscribe();
+    } catch (e) {
+      console.error('Failed to initialize Firebase:', e);
+    }
   }, []);
 
+  // Fetch all users on app load
   useEffect(() => {
-    fetchPosts();
-    fetchUsers();
-    fetchStories();
+    if (db) {
+      const usersCol = collection(db, 'artifacts', appId, 'public', 'data', 'users');
+      const unsubscribe = onSnapshot(usersCol, (snapshot) => {
+        const userMap: Record<string, User> = {};
+        snapshot.forEach(doc => {
+          const userData = doc.data();
+          userMap[doc.id] = {
+            id: doc.id,
+            name: userData.display_name,
+            handle: `@${userData.username}`,
+            avatar: userData.avatar_url || placeholderImg(userData.display_name || 'U')
+          };
+        });
+        setAllUsers(userMap);
+      });
+      return () => unsubscribe();
+    }
+  }, [db]);
 
-    // Real-time subscriptions
-    const postsChannel = supabase.channel('public:posts')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, () => fetchPosts())
-      .subscribe();
+  // Real-time listeners for posts and stories
+  useEffect(() => {
+    if (db && isAuthReady) {
+      const postsCol = collection(db, 'artifacts', appId, 'public', 'data', 'posts');
+      const postsUnsubscribe = onSnapshot(postsCol, (snapshot) => {
+        const posts: Post[] = [];
+        snapshot.forEach(doc => {
+          const postData = doc.data();
+          posts.push({
+            id: doc.id,
+            userId: postData.user_id,
+            text: postData.text,
+            media: postData.media_urls,
+            likes: postData.likes,
+            recasts: postData.recasts,
+            comments: postData.comments,
+            createdAt: postData.created_at
+          });
+        });
+        setAllPosts(posts);
+      });
 
-    const storiesChannel = supabase.channel('public:stories')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'stories' }, () => fetchStories())
-      .subscribe();
+      const storiesCol = collection(db, 'artifacts', appId, 'public', 'data', 'stories');
+      const storiesUnsubscribe = onSnapshot(storiesCol, (snapshot) => {
+        const stories: Story[] = [];
+        snapshot.forEach(doc => {
+          const storyData = doc.data();
+          stories.push({
+            id: doc.id,
+            userId: storyData.user_id,
+            url: storyData.media_url,
+            createdAt: storyData.created_at,
+            expiresAt: storyData.expires_at
+          });
+        });
+        setAllStories(stories);
+      });
+      return () => {
+        postsUnsubscribe();
+        storiesUnsubscribe();
+      };
+    }
+  }, [db, isAuthReady]);
 
-    return () => {
-      supabase.removeChannel(postsChannel);
-      supabase.removeChannel(storiesChannel);
-    };
-  }, []);
-
-  const fetchUserData = async (userId: string) => {
-    const { data: userProfile, error } = await supabase.from('users').select('*').eq('id', userId).single();
-    if (userProfile) {
+  const fetchUserData = async (userId: string, firestore: any) => {
+    const userRef = doc(firestore, 'artifacts', appId, 'public', 'data', 'users', userId);
+    const userSnap = await getDoc(userRef);
+    if (userSnap.exists()) {
+      const userProfile = userSnap.data();
       setMe({
-        id: userProfile.id,
+        id: userSnap.id,
         name: userProfile.display_name,
         handle: `@${userProfile.username}`,
         avatar: userProfile.avatar_url || placeholderImg(userProfile.display_name || 'U')
@@ -124,70 +202,47 @@ export default function App() {
     }
   };
 
-  const fetchPosts = async () => {
-    const { data, error } = await supabase.from('posts').select('*').order('created_at', { ascending: false });
-    if (data) setAllPosts(data as Post[]);
+  const fetchLikesAndRecasts = async (userId: string, firestore: any) => {
+    const likesQuery = query(collection(firestore, 'artifacts', appId, 'users', userId, 'likes'));
+    const likesSnapshot = await getDocs(likesQuery);
+    const likedMap: Record<string, boolean> = {};
+    likesSnapshot.forEach(doc => likedMap[doc.id] = true);
+    setLikes(likedMap);
+
+    const recastsQuery = query(collection(firestore, 'artifacts', appId, 'users', userId, 'recasts'));
+    const recastsSnapshot = await getDocs(recastsQuery);
+    const recastedMap: Record<string, boolean> = {};
+    recastsSnapshot.forEach(doc => recastedMap[doc.id] = true);
+    setRecasts(recastedMap);
   };
 
-  const fetchUsers = async () => {
-    const { data, error } = await supabase.from('users').select('*');
-    if (data) {
-      const userMap = data.reduce((acc, user) => {
-        acc[user.id] = { id: user.id, name: user.display_name, handle: `@${user.username}`, avatar: user.avatar_url || placeholderImg(user.display_name || 'U') };
-        return acc;
-      }, {});
-      setAllUsers(userMap);
-    }
+  const fetchFollowing = async (userId: string, firestore: any) => {
+    const followsQuery = query(collection(firestore, 'artifacts', appId, 'users', userId, 'following'));
+    const followsSnapshot = await getDocs(followsQuery);
+    const followingList: string[] = [];
+    followsSnapshot.forEach(doc => followingList.push(doc.id));
+    setFollowing(followingList);
   };
-
-  const fetchStories = async () => {
-    const { data, error } = await supabase.from('stories').select('*').gte('expires_at', new Date().toISOString());
-    if (data) setAllStories(data as Story[]);
-  };
-
-  const fetchLikesAndRecasts = async (userId: string) => {
-    const { data: likedPosts } = await supabase.from('likes').select('post_id').eq('user_id', userId);
-    if (likedPosts) {
-      const likedMap = likedPosts.reduce((acc, { post_id }) => ({ ...acc, [post_id]: true }), {});
-      setLikes(likedMap);
-    }
-    const { data: recastedPosts } = await supabase.from('recasts').select('post_id').eq('user_id', userId);
-    if (recastedPosts) {
-      const recastedMap = recastedPosts.reduce((acc, { post_id }) => ({ ...acc, [post_id]: true }), {});
-      setRecasts(recastedMap);
-    }
-  };
-
-  const fetchFollowing = async (userId: string) => {
-    const { data: follows } = await supabase.from('follows').select('following_id').eq('follower_id', userId);
-    if (follows) {
-      setFollowing(follows.map(f => f.following_id));
-    }
-  };
-
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("fuse/theme", theme);
   }, [theme]);
 
-
   // Navigation handlers
   const openProfile = useCallback((userId: string) => setRoute({ name: "profile", userId }), []);
   const openFeed = useCallback(() => setRoute({ name: "feed" }), []);
 
-  if (!session) {
-    return <AuthScreen setMe={setMe} />;
+  if (!isAuthReady) {
+    return <div className="min-h-dvh flex items-center justify-center bg-zinc-50 dark:bg-zinc-950">Loading...</div>;
   }
-  
   if (!me) {
-      return <div className="min-h-dvh flex items-center justify-center bg-zinc-50 dark:bg-zinc-950">Loading...</div>;
+    return <AuthScreen db={db} auth={auth} />;
   }
 
   return (
     <div className="min-h-dvh bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
       <Topbar onThemeToggle={() => setTheme((t) => (t === "dark" ? "light" : "dark"))} onSearch={setSearch} onHome={openFeed} onProfile={() => openProfile(me.id)} me={me} />
-
       <div className="max-w-3xl mx-auto p-4">
         {route.name === "feed" ? (
           <FeedScreen
@@ -202,12 +257,12 @@ export default function App() {
             activeTab={activeTab}
             setActiveTab={setActiveTab}
             onOpenProfile={openProfile}
-            onPostCreated={() => {}} // Supabase real-time handles this
-            onLikeRecast={fetchLikesAndRecasts}
+            db={db}
+            onLikeRecast={() => fetchLikesAndRecasts(me.id, db)}
           />
-        ) : (
-          <ProfileScreen me={me} posts={allPosts} users={allUsers} userId={route.userId} onBack={openFeed} onOpenProfile={openProfile} following={following} onFollowChange={fetchFollowing} onUpdatePfp={() => fetchUserData(me.id)}/>
-        )}
+        ) : route.name === "profile" ? (
+          <ProfileScreen me={me} posts={allPosts} users={allUsers} userId={route.userId} onBack={openFeed} onOpenProfile={openProfile} following={following} onFollowChange={() => fetchFollowing(me.id, db)} onUpdatePfp={() => fetchUserData(me.id, db)} db={db} />
+        ) : null}
       </div>
     </div>
   );
@@ -216,53 +271,31 @@ export default function App() {
 // ---------------------------
 // Auth Screen
 // ---------------------------
-function AuthScreen({ setMe }: { setMe: (user: User) => void }) {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [isSigningUp, setIsSigningUp] = useState(false);
-
+function AuthScreen({ db, auth }: { db: any, auth: any }) {
   const handleAuth = async () => {
-    if (isSigningUp) {
-      const { data, error } = await supabase.auth.signUp({ email, password });
-      if (error) {
-        alert(error.message);
-      } else if (data.user) {
-        // Create user profile in 'users' table
-        const { error: profileError } = await supabase
-          .from('users')
-          .insert([{ id: data.user.id, email, display_name: 'New User', username: data.user.email.split('@')[0] }]);
-        if (profileError) console.error("Error creating user profile:", profileError);
-        alert('Check your email for the confirmation link!');
+    try {
+      const credential = await signInAnonymously(auth);
+      const user = credential.user;
+      if (user) {
+        // Create user profile in 'users' collection
+        const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'users', user.uid);
+        await setDoc(userRef, {
+          display_name: 'New User',
+          username: user.uid.substring(0, 8),
+          created_at: new Date().toISOString()
+        }, { merge: true });
       }
-    } else {
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) alert(error.message);
+    } catch (error) {
+      console.error("Error during anonymous sign-in:", error);
     }
   };
 
   return (
     <div className="min-h-dvh flex items-center justify-center bg-zinc-50 dark:bg-zinc-950">
       <div className="bg-white dark:bg-zinc-900 p-8 rounded-xl shadow-lg w-full max-w-sm">
-        <h2 className="text-2xl font-bold mb-4 text-center">{isSigningUp ? 'Sign Up' : 'Log In'}</h2>
-        <input
-          type="email"
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          className="w-full p-2 mb-4 rounded border dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-800"
-        />
-        <input
-          type="password"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="w-full p-2 mb-4 rounded border dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-800"
-        />
+        <h2 className="text-2xl font-bold mb-4 text-center">Welcome to Fuse</h2>
         <button onClick={handleAuth} className="w-full p-2 rounded bg-blue-600 text-white">
-          {isSigningUp ? 'Sign Up' : 'Log In'}
-        </button>
-        <button onClick={() => setIsSigningUp(!isSigningUp)} className="w-full p-2 mt-2 text-sm text-blue-600">
-          {isSigningUp ? 'Already have an account? Log In' : 'Need an account? Sign Up'}
+          Start Anonymously
         </button>
       </div>
     </div>
@@ -272,11 +305,12 @@ function AuthScreen({ setMe }: { setMe: (user: User) => void }) {
 // ---------------------------
 // Topbar
 // ---------------------------
-function Topbar({ onThemeToggle, onSearch, onHome, onProfile, me }: { onThemeToggle: () => void; onSearch: (q: string) => void; onHome: () => void; onProfile: () => void; me: User }) {
+function Topbar({ onThemeToggle, onSearch, onHome, onProfile, me, auth }: { onThemeToggle: () => void; onSearch: (q: string) => void; onHome: () => void; onProfile: () => void; me: User; auth: any }) {
   const handleSignOut = async () => {
-    await supabase.auth.signOut();
+    if (auth) {
+      await auth.signOut();
+    }
   };
-
   return (
     <header className="sticky top-0 z-10 border-b border-zinc-200/50 dark:border-zinc-800/80 bg-white/70 dark:bg-zinc-950/70 backdrop-blur">
       <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-3">
@@ -296,8 +330,8 @@ function Topbar({ onThemeToggle, onSearch, onHome, onProfile, me }: { onThemeTog
         <div className="flex items-center gap-2">
           <button onClick={onThemeToggle} className="px-3 py-2 rounded-full border border-zinc-200 dark:border-zinc-800" aria-pressed={false}>Theme</button>
           <button onClick={onProfile} className="px-3 py-2 rounded-full border border-zinc-200 dark:border-zinc-800">Profile</button>
-          <button onClick={handleSignOut} className="px-3 py-2 rounded-full border border-zinc-200 dark:border-zinc-800">Sign Out</button>
         </div>
+        <button onClick={handleSignOut} className="px-3 py-2 rounded-full border border-zinc-200 dark:border-zinc-800">Sign Out</button>
       </div>
     </header>
   );
@@ -306,7 +340,7 @@ function Topbar({ onThemeToggle, onSearch, onHome, onProfile, me }: { onThemeTog
 // ---------------------------
 // Feed Screen
 // ---------------------------
-function FeedScreen({ me, posts, users, stories, likes, recasts, following, search, activeTab, setActiveTab, onOpenProfile, onLikeRecast }: { me: User; posts: Post[]; users: Record<string, User>; stories: Story[]; likes: Record<string, boolean>; recasts: Record<string, boolean>; following: string[]; search: string; activeTab: Tab; setActiveTab: (t: Tab) => void; onOpenProfile: (id: string) => void; onPostCreated: () => void; onLikeRecast: (userId: string) => void; }) {
+function FeedScreen({ me, posts, users, stories, likes, recasts, following, search, activeTab, setActiveTab, onOpenProfile, db, onLikeRecast }: { me: User; posts: Post[]; users: Record<string, User>; stories: Story[]; likes: Record<string, boolean>; recasts: Record<string, boolean>; following: string[]; search: string; activeTab: Tab; setActiveTab: (t: Tab) => void; onOpenProfile: (id: string) => void; db: any; onLikeRecast: () => void; }) {
   const [text, setText] = useState("");
   const [media, setMedia] = useState<File[]>([]);
   const [previewUrls, setPreviewUrls] = useState<string[]>([]);
@@ -337,74 +371,58 @@ function FeedScreen({ me, posts, users, stories, likes, recasts, following, sear
     return items;
   }, [posts, users, following, search, activeTab, score, me]);
 
-  async function onSelectFiles(files: FileList | null) {
+  const onSelectFiles = (files: FileList | null) => {
     if (!files) return;
     setMedia(Array.from(files).slice(0, 4));
-  }
-
+  };
   const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
-    const files = e.dataTransfer.files;
-    onSelectFiles(files);
+    onSelectFiles(e.dataTransfer.files);
   };
-
   const onDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(true);
   };
-
   const onDragLeave = () => setIsDragging(false);
 
   async function publish(kind: "post" | "story") {
     if (kind === "post" && !text.trim() && media.length === 0) {
-      alert("Write something or add a photo.");
+      console.error("Write something or add a photo.");
       return;
     }
     if (kind === "story" && media.length === 0) {
-      alert("Please add a photo for your story.");
+      console.error("Please add a photo for your story.");
       return;
     }
 
     const mediaUrls: string[] = [];
     if (media.length > 0) {
-      for (const file of media) {
-        const filePath = `${me.id}/${uid()}-${file.name}`;
-        const { error: uploadError } = await supabase.storage.from('media').upload(filePath, file);
-        if (uploadError) {
-          console.error("Error uploading media:", uploadError);
-          return;
-        }
-        const { data: { publicUrl } } = supabase.storage.from('media').getPublicUrl(filePath);
-        mediaUrls.push(publicUrl);
-      }
+      // Mocking image upload with a placeholder
+      const placeholderUrl = `https://placehold.co/600x400/232736/FFF?text=Image+Placeholder`;
+      mediaUrls.push(placeholderUrl);
     }
 
     if (kind === "post") {
-      const { error: postError } = await supabase
-        .from('posts')
-        .insert({
-          user_id: me.id,
-          text: text.slice(0, 500),
-          media_urls: mediaUrls,
-          created_at: new Date().toISOString()
-        });
-      
-      if (postError) {
-        console.error("Error creating post:", postError);
-      }
+      const postsCol = collection(db, 'artifacts', appId, 'public', 'data', 'posts');
+      await addDoc(postsCol, {
+        user_id: me.id,
+        text: text.slice(0, 500),
+        media_urls: mediaUrls,
+        likes: 0,
+        recasts: 0,
+        comments: 0,
+        created_at: new Date().toISOString()
+      });
     } else if (kind === "story") {
-      const { error: storyError } = await supabase
-        .from('stories')
-        .insert({
-          user_id: me.id,
-          media_url: mediaUrls[0],
-          created_at: new Date().toISOString(),
-          expires_at: new Date(Date.now() + 86_400_000).toISOString()
-        });
-        if (storyError) console.error("Error creating story:", storyError);
+      const storiesCol = collection(db, 'artifacts', appId, 'public', 'data', 'stories');
+      await addDoc(storiesCol, {
+        user_id: me.id,
+        media_url: mediaUrls[0],
+        created_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 86_400_000).toISOString()
+      });
     }
-
     setText("");
     setMedia([]);
     setPreviewUrls([]);
@@ -412,13 +430,20 @@ function FeedScreen({ me, posts, users, stories, likes, recasts, following, sear
 
   const toggle = async (postId: string, act: "like" | "recast" | "comment") => {
     if (act === "like") {
-      const isLiked = likes[postId];
-      if (isLiked) {
-        await supabase.from('likes').delete().match({ user_id: me.id, post_id: postId });
+      const likeRef = doc(db, 'artifacts', appId, 'users', me.id, 'likes', postId);
+      if (likes[postId]) {
+        await deleteDoc(likeRef);
       } else {
-        await supabase.from('likes').insert({ user_id: me.id, post_id: postId });
+        await setDoc(likeRef, { post_id: postId });
       }
-      onLikeRecast(me.id);
+
+      const postRef = doc(db, 'artifacts', appId, 'public', 'data', 'posts', postId);
+      const postSnap = await getDoc(postRef);
+      if (postSnap.exists()) {
+        const postData = postSnap.data();
+        await updateDoc(postRef, { likes: Math.max(0, postData.likes + (likes[postId] ? -1 : 1)) });
+      }
+      onLikeRecast();
     }
     // TODO: Implement recasts and comments logic
   };
@@ -494,7 +519,7 @@ function FeedScreen({ me, posts, users, stories, likes, recasts, following, sear
       </div>
 
       {/* Stories */}
-      <StoriesTray stories={stories} users={users} me={me} onOpenProfile={onOpenProfile} />
+      <StoriesTray stories={allStories} users={users} me={me} onOpenProfile={onOpenProfile} />
 
       {/* Feed */}
       <div className="mt-4">
@@ -518,11 +543,10 @@ function FeedScreen({ me, posts, users, stories, likes, recasts, following, sear
 // ---------------------------
 // Profile Screen (separate view)
 // ---------------------------
-function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, following, onFollowChange, onUpdatePfp }: { me: User; posts: Post[]; users: Record<string, User>; userId: string; onBack: () => void; onOpenProfile: (id: string) => void; following: string[]; onFollowChange: (userId: string) => void; onUpdatePfp: () => void; }) {
+function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, following, onFollowChange, onUpdatePfp, db }: { me: User; posts: Post[]; users: Record<string, User>; userId: string; onBack: () => void; onOpenProfile: (id: string) => void; following: string[]; onFollowChange: () => void; onUpdatePfp: () => void; db: any }) {
   const user = users[userId] || me;
   const isMe = userId === me.id;
   const userPosts = posts.filter((p: Post) => p.userId === userId);
-
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState(me.name);
   const [draftUsername, setDraftUsername] = useState(me.handle.substring(1));
@@ -532,65 +556,49 @@ function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, follow
 
   useEffect(() => {
     fetchProfileData();
-  }, [userId]);
+  }, [userId, db]);
 
   const fetchProfileData = async () => {
-    const { data } = await supabase.from('users').select('*').eq('id', userId).single();
-    if (data) {
-      setProfileData(data);
-      setDraftBio(data.bio || '');
-      setDraftLinks(data.links?.join('\n') || '');
+    const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'users', userId);
+    const userSnap = await getDoc(userRef);
+    if (userSnap.exists()) {
+      setProfileData(userSnap.data());
+      setDraftBio(userSnap.data().bio || '');
+      setDraftLinks(userSnap.data().links?.join('\n') || '');
     }
   };
 
   const handleUpdateProfile = async () => {
-    const { error } = await supabase
-      .from('users')
-      .update({
-        display_name: draftName,
-        username: draftUsername,
-        bio: draftBio.slice(0, 200),
-        links: draftLinks.split(/\s+/).filter(Boolean),
-      })
-      .eq('id', me.id);
-    
-    if (error) {
-      alert("Error updating profile. Username might be taken.");
-      console.error(error);
-    } else {
-      setEditing(false);
-      // Force a refresh of user data
-      const { data: userData } = await supabase.from('users').select('*').eq('id', me.id).single();
-      if (userData) {
-          me.name = userData.display_name;
-          me.handle = `@${userData.username}`;
-      }
-    }
+    const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'users', me.id);
+    await updateDoc(userRef, {
+      display_name: draftName,
+      username: draftUsername,
+      bio: draftBio.slice(0, 200),
+      links: draftLinks.split(/\s+/).filter(Boolean),
+    });
+    setEditing(false);
+    onUpdatePfp();
   };
 
-  const handlePfpChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const filePath = `${me.id}/avatar-${uid()}`;
-      const { data, error } = await supabase.storage.from('media').upload(filePath, file, { upsert: true });
-      if (error) {
-        console.error("Error uploading avatar:", error);
-        return;
-      }
-      const { data: { publicUrl } } = supabase.storage.from('media').getPublicUrl(filePath);
-      await supabase.from('users').update({ avatar_url: publicUrl }).eq('id', me.id);
+  const handlePfpChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    // Mocking image upload with a placeholder
+    if (e.target.files?.[0]) {
+      const newAvatar = `https://placehold.co/60x60/232736/FFF?text=${draftName[0]}`;
+      const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'users', me.id);
+      updateDoc(userRef, { avatar_url: newAvatar });
       onUpdatePfp();
     }
   };
 
   const toggleFollow = async () => {
+    const followRef = doc(db, 'artifacts', appId, 'users', me.id, 'following', userId);
     const isFollowing = following.includes(userId);
     if (isFollowing) {
-      await supabase.from('follows').delete().match({ follower_id: me.id, following_id: userId });
+      await deleteDoc(followRef);
     } else {
-      await supabase.from('follows').insert({ follower_id: me.id, following_id: userId });
+      await setDoc(followRef, { user_id: userId });
     }
-    onFollowChange(me.id);
+    onFollowChange();
   };
 
   const followingMe = following.includes(userId);
@@ -620,7 +628,7 @@ function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, follow
           </div>
           <div className="flex-1">
             <div className="text-xl font-semibold">{user.name}</div>
-            <div className="text-zinc-500">{user.handle}</div>
+            <div className="text-zinc-500">User ID: {user.id}</div>
           </div>
           {isMe ? (
             <button onClick={() => setEditing((e) => !e)} className="px-4 py-2 rounded-full border border-zinc-300 dark:border-zinc-700">
@@ -684,7 +692,7 @@ function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, follow
               </button>
             </div>
           </div>
-        )}
+        ) : null}
       </div>
 
       {/* Story Highlights (fun mock) */}
@@ -715,7 +723,7 @@ function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, follow
           <div className="grid grid-cols-3 gap-2">
             {userPosts.map((p) => (
               <div key={p.id} className="aspect-square rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900">
-                {p.media[0] ? (
+                {p.media?.[0] ? (
                   <img src={p.media[0]} alt="post" className="w-full h-full object-cover" loading="lazy" />
                 ) : (
                   <div className="w-full h-full grid place-items-center text-zinc-500 text-sm p-2 text-center">{p.text.slice(0, 60) || "Post"}</div>
@@ -743,19 +751,17 @@ function StoriesTray({ stories, users, me, onOpenProfile }: { stories: Story[]; 
     <div className="flex gap-3 overflow-x-auto py-3">
       <button key="self" className="text-center flex-shrink-0" onClick={() => onOpenProfile(me.id)} aria-label="Open your profile">
         <div className="w-[70px] h-[70px] rounded-full p-[3px] bg-gradient-to-tr from-emerald-400 via-blue-400 to-pink-400">
-          <div className="w-full h-full rounded-full bg-white dark:bg-zinc-950 border-2 border-white dark:border-zinc-950 overflow-hidden grid place-items-center">
+          <div className="w-full h-full rounded-full bg-white dark:bg-zinc-950 border-2 border-white dark:border-950 overflow-hidden grid place-items-center">
             <span className="text-xl">{me.name?.[0]}</span>
           </div>
         </div>
         <div className="text-xs text-zinc-500 mt-1 w-[70px] truncate">Your story</div>
       </button>
-
       {allStories.map((s) => (
         <button key={s.id} className="text-center flex-shrink-0" onClick={() => onOpenProfile(s.userId)} aria-label={`Open ${users[s.userId]?.name || "user"} profile`}>
           <div className="w-[70px] h-[70px] rounded-full p-[3px] bg-gradient-to-tr from-emerald-400 via-blue-400 to-pink-400">
-            <div className="w-full h-full rounded-full bg-white dark:bg-zinc-950 border-2 border-white dark:border-zinc-950 overflow-hidden grid place-items-center">
-              {/* @ts-ignore */}
-              {s.media_url ? <img src={s.media_url} alt="story" className="w-full h-full object-cover" loading="lazy" /> : <span className="text-xl">{(users[s.userId]?.name || "U")[0]}</span>}
+            <div className="w-full h-full rounded-full bg-white dark:bg-zinc-950 border-2 border-white dark:border-950 overflow-hidden grid place-items-center">
+              {s.url ? <img src={s.url} alt="story" className="w-full h-full object-cover" loading="lazy" /> : <span className="text-xl">{(users[s.userId]?.name || "U")[0]}</span>}
             </div>
           </div>
           <div className="text-xs text-zinc-500 mt-1 w-[70px] truncate">{users[s.userId]?.name}</div>
@@ -781,7 +787,7 @@ function PostCard({ post, user, me, liked, recasted, onToggle, onOpenProfile }: 
         console.error('Error sharing:', error);
       }
     } else {
-      alert("Web Share API is not supported in this browser.");
+      console.error("Web Share API is not supported in this browser.");
     }
   };
 
