@@ -1,17 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { createClient, User as SupabaseUser } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.44.2/+esm";
 
-/**
- * Fuse — Instagram/X hybrid demo (React + TypeScript, single-file)
- *
- * What’s improved (high-impact, no-backend):
- * - Stronger typing: central State/Route/Tab types, fewer `any`s.
- * - Safer state updates: no in-place post mutation; pure, immutable updates.
- * - Better UX: drag & drop media, lazy-loaded images, accessible labels, small a11y tweaks.
- * - Performance: memoized handlers, lighter localStorage writes (micro‑debounce).
- * - Time freshness: feed timestamps auto-refresh every 60s.
- * - Small quality-of-life: follow/unfollow on profiles; number formatting; link security.
- * - Kept/expanded lightweight runtime self-tests.
- */
+// Supabase configuration
+const SUPABASE_URL = "YOUR_SUPABASE_URL_HERE";
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY_HERE";
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ---------------------------
 // Types (TypeScript)
@@ -20,41 +13,29 @@ export type User = {
   id: string;
   name: string;
   handle: string;
-  avatar?: string;
+  avatar_url?: string;
+  bio?: string;
+  links?: string[];
 };
 export type Post = {
   id: string;
-  userId: string;
+  author_id: string;
   text: string;
-  media: string[];
+  media_urls: string[];
   likes: number;
   recasts: number;
   comments: number;
-  createdAt: number;
+  created_at: string;
 };
 export type Story = {
   id: string;
-  userId: string;
-  url: string;
-  createdAt: number;
-  expiresAt: number;
+  author_id: string;
+  media_url: string;
+  created_at: string;
 };
 
 type Tab = "forYou" | "following" | "latest";
-
 type Route = { name: "feed" } | { name: "profile"; userId: string };
-
-type State = {
-  me: User;
-  following: string[];
-  users: Record<string, User>;
-  stories: Story[];
-  posts: Post[];
-  likes: Record<string, boolean>;
-  recasts: Record<string, boolean>;
-  bio: Record<string, string>;
-  links: Record<string, string[]>;
-};
 
 // ---------------------------
 // Helpers
@@ -63,7 +44,6 @@ const uid = () =>
   typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2, 10);
-const now = () => Date.now();
 const clamp = (n: number, min: number, max: number) =>
   Math.min(Math.max(n, min), max);
 const formatCount = (n: number) =>
@@ -73,9 +53,8 @@ const placeholderImg = (seed = "U") => {
   const txt = encodeURIComponent(seed[0] || "U");
   return `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='600' height='400'><rect width='100%' height='100%' fill='${bg}'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='white' font-size='120' font-family='system-ui'>${txt}</text></svg>`;
 };
-
-const timeAgo = (ts: number) => {
-  const d = Math.floor((Date.now() - ts) / 1000);
+const timeAgo = (ts: string) => {
+  const d = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
   if (d < 60) return `${d}s`;
   if (d < 3600) return `${Math.floor(d / 60)}m`;
   if (d < 86400) return `${Math.floor(d / 3600)}h`;
@@ -83,113 +62,21 @@ const timeAgo = (ts: number) => {
   if (days < 7) return `${days}d`;
   return new Date(ts).toLocaleDateString();
 };
-
 const safeLinkProps = { target: "_blank", rel: "noopener noreferrer" } as const;
-
-// ---------------------------
-// Seed Data
-// ---------------------------
-const DEFAULT_USER: User = { id: "u1", name: "You", handle: "@you" };
-const SEED = (() => {
-  const t = now();
-  const base: State = {
-    me: DEFAULT_USER,
-    following: ["u2", "u3", "u4"],
-    users: {
-      u1: DEFAULT_USER,
-      u2: { id: "u2", name: "Ari", handle: "@ari" },
-      u3: { id: "u3", name: "Noor", handle: "@noor" },
-      u4: { id: "u4", name: "Leo", handle: "@leo" },
-    },
-    stories: [
-      {
-        id: "s1",
-        userId: "u2",
-        url: "",
-        createdAt: t - 1000 * 60 * 60 * 2,
-        expiresAt: t + 1000 * 60 * 60 * 22,
-      },
-      {
-        id: "s2",
-        userId: "u3",
-        url: "",
-        createdAt: t - 1000 * 60 * 60 * 10,
-        expiresAt: t + 1000 * 60 * 60 * 14,
-      },
-    ],
-    posts: [
-      {
-        id: "p1",
-        userId: "u2",
-        text: "Building in public. Today: micro-interactions ✨",
-        media: [],
-        likes: 3,
-        recasts: 1,
-        comments: 0,
-        createdAt: t - 1000 * 60 * 30,
-      },
-      {
-        id: "p2",
-        userId: "u3",
-        text: "Morning sunlight > afternoon coffee.",
-        media: [],
-        likes: 12,
-        recasts: 2,
-        comments: 3,
-        createdAt: t - 1000 * 60 * 90,
-      },
-      {
-        id: "p3",
-        userId: "u4",
-        text: "Shot on phone 📸",
-        media: [],
-        likes: 7,
-        recasts: 0,
-        comments: 1,
-        createdAt: t - 1000 * 60 * 60 * 4,
-      },
-    ],
-    likes: {},
-    recasts: {},
-    bio: {
-      u1: "Designing my day in public. Coffee. Cameras. Code.",
-      u2: "Tiny UI experiments.",
-      u3: "Behavioral science + product.",
-      u4: "Street photos and synths.",
-    },
-    links: { u1: ["https://example.com"], u2: [], u3: [], u4: [] },
-  };
-  return base;
-})();
-
-const STORE_KEY = "fuse/react-demo/v2"; // bumped version
-
-function loadState(): State {
-  try {
-    const raw = localStorage.getItem(STORE_KEY);
-    if (!raw) return SEED;
-    const data = JSON.parse(raw);
-    // Basic shape guard; fall back to SEED on obvious mismatch
-    if (!data || typeof data !== "object" || !("posts" in data)) return SEED;
-    return { ...SEED, ...data } as State;
-  } catch {
-    return SEED;
-  }
-}
-
-let saveTimer: number | undefined;
-function saveStateDebounced(s: State) {
-  if (saveTimer) window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    localStorage.setItem(STORE_KEY, JSON.stringify(s));
-  }, 200);
-}
 
 // ---------------------------
 // App
 // ---------------------------
 export default function App() {
-  const [state, setState] = useState<State>(loadState());
+  const [supabaseUser, setSupabaseUser] = useState<SupabaseUser | null>(null);
+  const [users, setUsers] = useState<User[]>([]);
+  const [me, setMe] = useState<User | null>(null);
+  const [posts, setPosts] = useState<Post[]>([]);
+  const [stories, setStories] = useState<Story[]>([]);
+  const [followingIds, setFollowingIds] = useState<string[]>([]);
+  const [likedPosts, setLikedPosts] = useState<string[]>([]);
+  const [recastedPosts, setRecastedPosts] = useState<string[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [theme, setTheme] = useState<string>(
     () =>
       localStorage.getItem("fuse/theme") ||
@@ -198,7 +85,76 @@ export default function App() {
   const [route, setRoute] = useState<Route>({ name: "feed" });
   const [search, setSearch] = useState("");
   const [activeTab, setActiveTab] = useState<Tab>("forYou");
-  const [tick, setTick] = useState(0); // drive timeAgo refresh
+  const [tick, setTick] = useState(0);
+
+  // Auth and data fetch
+  useEffect(() => {
+    async function fetchData() {
+      setIsLoading(true);
+
+      const { data: authData } = await supabase.auth.signInAnonymously();
+      setSupabaseUser(authData.user);
+
+      // Fetch users
+      const { data: userData, error: userError } = await supabase
+        .from("profiles")
+        .select("*");
+      if (userData) {
+        setUsers(userData);
+        const myProfile = userData.find((u) => u.id === authData.user?.id);
+        if (myProfile) {
+          setMe(myProfile);
+        } else {
+          // Create new user if not found
+          const newUser = {
+            id: authData.user?.id || "",
+            name: "You",
+            handle: `@you${Math.floor(Math.random() * 1000)}`,
+          };
+          const { data: newUserData } = await supabase
+            .from("profiles")
+            .insert(newUser)
+            .select()
+            .single();
+          if (newUserData) {
+            setMe(newUserData);
+            setUsers([...userData, newUserData]);
+          }
+        }
+      }
+
+      // Fetch posts, stories, etc.
+      const { data: postsData } = await supabase.from("posts").select("*");
+      if (postsData) setPosts(postsData);
+
+      const { data: storiesData } = await supabase.from("stories").select("*");
+      if (storiesData) setStories(storiesData);
+
+      if (authData.user) {
+        const { data: followingData } = await supabase
+          .from("following")
+          .select("followed_id")
+          .eq("follower_id", authData.user.id);
+        if (followingData)
+          setFollowingIds(followingData.map((f) => f.followed_id));
+
+        const { data: likesData } = await supabase
+          .from("post_likes")
+          .select("post_id")
+          .eq("user_id", authData.user.id);
+        if (likesData) setLikedPosts(likesData.map((l) => l.post_id));
+
+        const { data: recastsData } = await supabase
+          .from("post_recasts")
+          .select("post_id")
+          .eq("user_id", authData.user.id);
+        if (recastsData) setRecastedPosts(recastsData.map((r) => r.post_id));
+      }
+
+      setIsLoading(false);
+    }
+    fetchData();
+  }, []);
 
   // Theme
   useEffect(() => {
@@ -206,34 +162,12 @@ export default function App() {
     localStorage.setItem("fuse/theme", theme);
   }, [theme]);
 
-  // Persist (debounced)
-  useEffect(() => {
-    saveStateDebounced(state);
-  }, [state]);
-
   // timeAgo auto-refresh
   useEffect(() => {
     const id = setInterval(() => setTick((n) => n + 1), 60_000);
     return () => clearInterval(id);
   }, []);
-
-  // Prune expired stories periodically
-  useEffect(() => {
-    const prune = () =>
-      setState((s) => ({
-        ...s,
-        stories: s.stories.filter((st) => st.expiresAt > Date.now()),
-      }));
-    prune();
-    const id = setInterval(prune, 60_000);
-    return () => clearInterval(id);
-  }, []);
-
-  // Run lightweight self-tests once in dev
-  useEffect(() => {
-    runSelfTests();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  void tick; // silence usage
 
   // Navigation handlers
   const openProfile = useCallback(
@@ -242,8 +176,13 @@ export default function App() {
   );
   const openFeed = useCallback(() => setRoute({ name: "feed" }), []);
 
-  // silence `tick` usage (forces refresh)
-  void tick;
+  if (isLoading || !me) {
+    return (
+      <div className="min-h-dvh grid place-items-center bg-zinc-50 dark:bg-zinc-950">
+        <div className="text-lg animate-pulse">Loading...</div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-dvh bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
@@ -251,14 +190,23 @@ export default function App() {
         onThemeToggle={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
         onSearch={setSearch}
         onHome={openFeed}
-        onProfile={() => openProfile(state.me.id)}
+        onProfile={() => openProfile(me.id)}
       />
-
       <div className="max-w-3xl mx-auto p-4">
         {route.name === "feed" ? (
           <FeedScreen
-            state={state}
-            setState={setState}
+            me={me}
+            users={users}
+            posts={posts}
+            stories={stories}
+            followingIds={followingIds}
+            likedPosts={likedPosts}
+            recastedPosts={recastedPosts}
+            setPosts={setPosts}
+            setStories={setStories}
+            setFollowingIds={setFollowingIds}
+            setLikedPosts={setLikedPosts}
+            setRecastedPosts={setRecastedPosts}
             search={search}
             activeTab={activeTab}
             setActiveTab={setActiveTab}
@@ -266,8 +214,12 @@ export default function App() {
           />
         ) : (
           <ProfileScreen
-            state={state}
-            setState={setState}
+            me={me}
+            users={users}
+            posts={posts}
+            followingIds={followingIds}
+            setUsers={setUsers}
+            setFollowingIds={setFollowingIds}
             userId={route.userId}
             onBack={openFeed}
             onOpenProfile={openProfile}
@@ -348,15 +300,35 @@ function Topbar({
 // Feed Screen
 // ---------------------------
 function FeedScreen({
-  state,
-  setState,
+  me,
+  users,
+  posts,
+  stories,
+  followingIds,
+  likedPosts,
+  recastedPosts,
+  setPosts,
+  setStories,
+  setFollowingIds,
+  setLikedPosts,
+  setRecastedPosts,
   search,
   activeTab,
   setActiveTab,
   onOpenProfile,
 }: {
-  state: State;
-  setState: React.Dispatch<React.SetStateAction<State>>;
+  me: User;
+  users: User[];
+  posts: Post[];
+  stories: Story[];
+  followingIds: string[];
+  likedPosts: string[];
+  recastedPosts: string[];
+  setPosts: React.Dispatch<React.SetStateAction<Post[]>>;
+  setStories: React.Dispatch<React.SetStateAction<Story[]>>;
+  setFollowingIds: React.Dispatch<React.SetStateAction<string[]>>;
+  setLikedPosts: React.Dispatch<React.SetStateAction<string[]>>;
+  setRecastedPosts: React.Dispatch<React.SetStateAction<string[]>>;
   search: string;
   activeTab: Tab;
   setActiveTab: (t: Tab) => void;
@@ -365,33 +337,38 @@ function FeedScreen({
   const [text, setText] = useState("");
   const [images, setImages] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [isSeeding, setIsSeeding] = useState(false);
 
-  const score = useCallback((_s: State, p: Post) => {
-    const ageH = (Date.now() - p.createdAt) / 3_600_000;
+  const score = useCallback((p: Post) => {
+    const ageH = (new Date().getTime() - new Date(p.created_at).getTime()) / 3_600_000;
     const engagement = p.likes * 2 + p.recasts * 3 + p.comments;
     return engagement + clamp(12 - ageH, 0, 12);
   }, []);
 
+  const usersMap = useMemo(() => {
+    return users.reduce<Record<string, User>>((acc, user) => {
+      acc[user.id] = user;
+      return acc;
+    }, {});
+  }, [users]);
+
   const filtered = useMemo(() => {
-    let items: Post[] = [...state.posts];
+    let items: Post[] = [...posts];
     if (activeTab === "following") {
-      const fset = new Set(state.following);
-      items = items.filter(
-        (p) => fset.has(p.userId) || p.userId === state.me.id
-      );
+      const fset = new Set(followingIds);
+      items = items.filter((p) => fset.has(p.author_id) || p.author_id === me.id);
     }
-    if (activeTab === "latest") items.sort((a, b) => b.createdAt - a.createdAt);
-    if (activeTab === "forYou")
-      items.sort((a, b) => score(state, b) - score(state, a));
+    if (activeTab === "latest") items.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    if (activeTab === "forYou") items.sort((a, b) => score(b) - score(a));
     const q = search.trim().toLowerCase();
     if (q)
       items = items.filter(
         (p) =>
           p.text.toLowerCase().includes(q) ||
-          state.users[p.userId].name.toLowerCase().includes(q)
+          usersMap[p.author_id]?.name.toLowerCase().includes(q)
       );
     return items;
-  }, [state, search, activeTab, score]);
+  }, [posts, search, activeTab, score, usersMap, followingIds, me]);
 
   async function onSelectFiles(files: FileList | null) {
     if (!files) return;
@@ -417,81 +394,134 @@ function FeedScreen({
 
   const onDragLeave = () => setIsDragging(false);
 
-  function publish(kind: "post" | "story") {
-    if (!text.trim() && images.length === 0)
-      return alert("Write something or add a photo.");
-    const p: Post = {
-      id: `p_${uid()}`,
-      userId: state.me.id,
-      text: text.slice(0, 500),
-      media: images,
-      likes: 0,
-      recasts: 0,
-      comments: 0,
-      createdAt: now(),
-    };
-    const next: State = { ...state, posts: [p, ...state.posts] };
-    if (kind === "story") {
-      const st: Story = {
-        id: `s_${uid()}`,
-        userId: state.me.id,
-        url: images[0] || placeholderImg("You"),
-        createdAt: now(),
-        expiresAt: now() + 86_400_000,
+  async function publish(kind: "post" | "story") {
+    if (!text.trim() && images.length === 0) return;
+    if (kind === "post") {
+      const newPost = {
+        author_id: me.id,
+        text: text.slice(0, 500),
+        media_urls: images,
       };
-      next.stories = [st, ...state.stories];
+      const { data, error } = await supabase.from("posts").insert(newPost).select();
+      if (data) setPosts((p) => [...data, ...p]);
+    } else {
+      const newStory = {
+        author_id: me.id,
+        media_url: images[0] || placeholderImg(me.name),
+        expires_at: new Date(Date.now() + 86400000).toISOString(),
+      };
+      const { data, error } = await supabase.from("stories").insert(newStory).select();
+      if (data) setStories((s) => [...data, ...s]);
     }
-    setState(next);
     setText("");
     setImages([]);
   }
 
-  const toggle = (postId: string, act: "like" | "recast" | "comment") => {
-    setState((prev) => {
-      const likes = { ...prev.likes };
-      const recasts = { ...prev.recasts };
-      const posts = prev.posts.map((p) => {
-        if (p.id !== postId) return p;
-        if (act === "like") {
-          const willLike = !likes[p.id];
-          likes[p.id] = willLike;
-          return { ...p, likes: p.likes + (willLike ? 1 : -1) };
-        }
-        if (act === "recast") {
-          const willRecast = !recasts[p.id];
-          recasts[p.id] = willRecast;
-          return { ...p, recasts: p.recasts + (willRecast ? 1 : -1) };
-        }
-        // comment
-        return { ...p, comments: p.comments + 1 };
-      });
-      return { ...prev, posts, likes, recasts };
-    });
-  };
+  async function toggleLike(postId: string) {
+    if (likedPosts.includes(postId)) {
+      await supabase.from("post_likes").delete().match({ user_id: me.id, post_id: postId });
+      setLikedPosts(likedPosts.filter((id) => id !== postId));
+      const postToUpdate = posts.find((p) => p.id === postId);
+      if (postToUpdate) {
+        await supabase.from("posts").update({ likes: postToUpdate.likes - 1 }).eq("id", postId);
+        setPosts(posts.map((p) => (p.id === postId ? { ...p, likes: p.likes - 1 } : p)));
+      }
+    } else {
+      await supabase.from("post_likes").insert({ user_id: me.id, post_id: postId });
+      setLikedPosts([...likedPosts, postId]);
+      const postToUpdate = posts.find((p) => p.id === postId);
+      if (postToUpdate) {
+        await supabase.from("posts").update({ likes: postToUpdate.likes + 1 }).eq("id", postId);
+        setPosts(posts.map((p) => (p.id === postId ? { ...p, likes: p.likes + 1 } : p)));
+      }
+    }
+  }
+
+  async function toggleRecast(postId: string) {
+    if (recastedPosts.includes(postId)) {
+      await supabase.from("post_recasts").delete().match({ user_id: me.id, post_id: postId });
+      setRecastedPosts(recastedPosts.filter((id) => id !== postId));
+      const postToUpdate = posts.find((p) => p.id === postId);
+      if (postToUpdate) {
+        await supabase.from("posts").update({ recasts: postToUpdate.recasts - 1 }).eq("id", postId);
+        setPosts(posts.map((p) => (p.id === postId ? { ...p, recasts: p.recasts - 1 } : p)));
+      }
+    } else {
+      await supabase.from("post_recasts").insert({ user_id: me.id, post_id: postId });
+      setRecastedPosts([...recastedPosts, postId]);
+      const postToUpdate = posts.find((p) => p.id === postId);
+      if (postToUpdate) {
+        await supabase.from("posts").update({ recasts: postToUpdate.recasts + 1 }).eq("id", postId);
+        setPosts(posts.map((p) => (p.id === postId ? { ...p, recasts: p.recasts + 1 } : p)));
+      }
+    }
+  }
+
+  const toggle = useCallback(
+    (postId: string, act: "like" | "recast" | "comment") => {
+      if (act === "like") toggleLike(postId);
+      if (act === "recast") toggleRecast(postId);
+      // comment logic not implemented in this demo
+    },
+    [likedPosts, recastedPosts]
+  );
 
   const overLimit = text.length > 500;
 
+  const seedDatabase = async () => {
+    setIsSeeding(true);
+    const seedUsers = [
+      { id: uid(), name: "Ari", handle: "@ari", bio: "Tiny UI experiments." },
+      { id: uid(), name: "Noor", handle: "@noor", bio: "Behavioral science + product." },
+      { id: uid(), name: "Leo", handle: "@leo", bio: "Street photos and synths." },
+    ];
+    await supabase.from("profiles").insert(seedUsers);
+    
+    const seedPosts = [
+      { author_id: seedUsers[0].id, text: "Building in public. Today: micro-interactions ✨", media_urls: [], likes: 3, recasts: 1, comments: 0, created_at: new Date(Date.now() - 1000 * 60 * 30).toISOString() },
+      { author_id: seedUsers[1].id, text: "Morning sunlight > afternoon coffee.", media_urls: [], likes: 12, recasts: 2, comments: 3, created_at: new Date(Date.now() - 1000 * 60 * 90).toISOString() },
+      { author_id: seedUsers[2].id, text: "Shot on phone 📸", media_urls: [], likes: 7, recasts: 0, comments: 1, created_at: new Date(Date.now() - 1000 * 60 * 60 * 4).toISOString() },
+    ];
+    await supabase.from("posts").insert(seedPosts);
+
+    const seedStories = [
+      { author_id: seedUsers[0].id, media_url: placeholderImg("Ari"), created_at: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString(), expires_at: new Date(Date.now() + 1000 * 60 * 60 * 22).toISOString() },
+    ];
+    await supabase.from("stories").insert(seedStories);
+    
+    setIsSeeding(false);
+    // Refresh data
+    window.location.reload();
+  };
+
   return (
     <div>
-      {/* Tabs */}
-      <div className="flex justify-center gap-2 py-3">
-        {(["forYou", "following", "latest"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setActiveTab(t)}
-            className={`px-4 py-2 rounded-full border text-sm ${
-              activeTab === t
-                ? "bg-blue-600 text-white border-transparent"
-                : "border-zinc-300 dark:border-zinc-700"
-            }`}
-            aria-pressed={activeTab === t}
-          >
-            {t === "forYou" ? "For you" : t[0].toUpperCase() + t.slice(1)}
-          </button>
-        ))}
+      <div className="flex justify-between items-center py-3">
+        <div className="flex gap-2">
+          {(["forYou", "following", "latest"] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setActiveTab(t)}
+              className={`px-4 py-2 rounded-full border text-sm ${
+                activeTab === t
+                  ? "bg-blue-600 text-white border-transparent"
+                  : "border-zinc-300 dark:border-zinc-700"
+              }`}
+              aria-pressed={activeTab === t}
+            >
+              {t === "forYou" ? "For you" : t[0].toUpperCase() + t.slice(1)}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={seedDatabase}
+          className={`px-4 py-2 rounded-full text-sm ${isSeeding ? 'bg-zinc-500' : 'bg-green-600'} text-white`}
+          disabled={isSeeding}
+        >
+          {isSeeding ? 'Seeding...' : 'Seed Database'}
+        </button>
       </div>
 
-      {/* Composer */}
       <div
         className={`bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-dashed ${
           isDragging
@@ -504,7 +534,7 @@ function FeedScreen({
         aria-label="Composer"
       >
         <div className="flex gap-3">
-          <Avatar user={state.me} onClick={() => onOpenProfile(state.me.id)} />
+          <Avatar user={me} onClick={() => onOpenProfile(me.id)} />
           <div className="flex-1">
             <textarea
               value={text}
@@ -566,20 +596,18 @@ function FeedScreen({
         </div>
       </div>
 
-      {/* Stories */}
-      <StoriesTray state={state} onOpenProfile={onOpenProfile} />
+      <StoriesTray stories={stories} users={usersMap} onOpenProfile={onOpenProfile} me={me} />
 
-      {/* Feed */}
       <div className="mt-4">
         {filtered.map((p) => (
           <PostCard
             key={p.id}
             post={p}
-            user={state.users[p.userId]}
-            me={state.me}
-            liked={!!state.likes[p.id]}
-            recasted={!!state.recasts[p.id]}
-            onToggle={(act) => toggle(p.id, act)}
+            user={usersMap[p.author_id] || me}
+            me={me}
+            liked={likedPosts.includes(p.id)}
+            recasted={recastedPosts.includes(p.id)}
+            onToggle={toggle}
             onOpenProfile={onOpenProfile}
           />
         ))}
@@ -592,52 +620,67 @@ function FeedScreen({
 // Profile Screen (separate view)
 // ---------------------------
 function ProfileScreen({
-  state,
-  setState,
+  me,
+  users,
+  posts,
+  followingIds,
+  setUsers,
+  setFollowingIds,
   userId,
   onBack,
+  onOpenProfile,
 }: {
-  state: State;
-  setState: React.Dispatch<React.SetStateAction<State>>;
+  me: User;
+  users: User[];
+  posts: Post[];
+  followingIds: string[];
+  setUsers: React.Dispatch<React.SetStateAction<User[]>>;
+  setFollowingIds: React.Dispatch<React.SetStateAction<string[]>>;
   userId: string;
   onBack: () => void;
   onOpenProfile: (id: string) => void;
 }) {
-  const user: User = state.users[userId] || DEFAULT_USER;
-  const isMe = userId === state.me.id;
-  const bio = state.bio[userId] || "";
-  const links: string[] = state.links[userId] || [];
-  const posts: Post[] = state.posts.filter((p: Post) => p.userId === userId);
+  const usersMap = useMemo(() => {
+    return users.reduce<Record<string, User>>((acc, user) => {
+      acc[user.id] = user;
+      return acc;
+    }, {});
+  }, [users]);
+  const user: User = usersMap[userId] || me;
+  const isMe = userId === me.id;
+  const postsByUser: Post[] = posts.filter((p: Post) => p.author_id === userId);
 
   const [editing, setEditing] = useState(false);
-  const [draftBio, setDraftBio] = useState(bio);
-  const [draftLinks, setDraftLinks] = useState(links.join("\n"));
+  const [draftBio, setDraftBio] = useState(user.bio || "");
+  const [draftLinks, setDraftLinks] = useState((user.links || []).join("\n"));
 
-  function saveProfile() {
-    setState((prev) => {
-      const next = { ...prev };
-      next.bio[userId] = draftBio.slice(0, 200);
-      next.links[userId] = draftLinks
-        .split(/\n+/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .slice(0, 3);
-      return next;
-    });
+  async function saveProfile() {
+    const nextLinks = draftLinks
+      .split(/\n+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    const updates = {
+      bio: draftBio.slice(0, 200),
+      links: nextLinks,
+    };
+    await supabase.from("profiles").update(updates).eq("id", me.id);
+    setUsers(users.map((u) => (u.id === me.id ? { ...u, ...updates } : u)));
     setEditing(false);
   }
 
-  const toggleFollow = () => {
+  async function toggleFollow() {
     if (isMe) return;
-    setState((prev) => {
-      const following = new Set(prev.following);
-      if (following.has(userId)) following.delete(userId);
-      else following.add(userId);
-      return { ...prev, following: Array.from(following) };
-    });
-  };
+    if (followingIds.includes(userId)) {
+      await supabase.from("following").delete().match({ follower_id: me.id, followed_id: userId });
+      setFollowingIds(followingIds.filter((id) => id !== userId));
+    } else {
+      await supabase.from("following").insert({ follower_id: me.id, followed_id: userId });
+      setFollowingIds([...followingIds, userId]);
+    }
+  }
 
-  const followingMe = state.following.includes(userId);
+  const followingMe = followingIds.includes(userId);
 
   return (
     <div>
@@ -651,11 +694,9 @@ function ProfileScreen({
         </button>
         <div className="text-sm text-zinc-500">Profile</div>
       </div>
-
-      {/* Header */}
       <div className="bg-white dark:bg-zinc-900 rounded-3xl border border-zinc-200 dark:border-zinc-800 p-6">
         <div className="flex items-center gap-4">
-          <Avatar size={72} user={user} />
+          <Avatar size={72} user={user} onClick={() => onOpenProfile(user.id)} />
           <div className="flex-1">
             <div className="text-xl font-semibold">{user.name}</div>
             <div className="text-zinc-500">{user.handle}</div>
@@ -680,17 +721,16 @@ function ProfileScreen({
             </button>
           )}
         </div>
-
         {!editing ? (
           <div className="mt-4 space-y-2">
-            {bio && (
+            {user.bio && (
               <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                {bio}
+                {user.bio}
               </p>
             )}
-            {links.length > 0 && (
+            {(user.links || []).length > 0 && (
               <div className="flex flex-wrap gap-2">
-                {links.map((url, i) => (
+                {(user.links || []).map((url, i) => (
                   <a
                     key={i}
                     href={url}
@@ -704,15 +744,15 @@ function ProfileScreen({
             )}
             <div className="flex gap-4 text-sm text-zinc-500 pt-1">
               <span>
-                <b>{posts.length}</b> posts
+                <b>{postsByUser.length}</b> posts
               </span>
               <span>
-                <b>{Math.max(3, Math.floor(posts.length * 3.2))}</b> followers
+                <b>{Math.max(3, Math.floor(postsByUser.length * 3.2))}</b> followers
               </span>
               <span>
                 Joined{" "}
                 {new Date(
-                  Math.min(...posts.map((p) => p.createdAt), Date.now())
+                  Math.min(...postsByUser.map((p) => new Date(p.created_at).getTime()), Date.now())
                 ).toLocaleDateString()}
               </span>
             </div>
@@ -756,8 +796,6 @@ function ProfileScreen({
           </div>
         )}
       </div>
-
-      {/* Story Highlights (fun mock) */}
       <div className="mt-6">
         <div className="font-medium mb-2">Highlights</div>
         <div className="flex gap-4 overflow-x-auto pb-2">
@@ -771,8 +809,6 @@ function ProfileScreen({
           ))}
         </div>
       </div>
-
-      {/* Posts grid */}
       <div className="mt-6">
         <div className="flex items-center justify-between mb-2">
           <div className="font-medium">Posts</div>
@@ -785,18 +821,18 @@ function ProfileScreen({
             </button>
           </div>
         </div>
-        {posts.length === 0 ? (
+        {postsByUser.length === 0 ? (
           <div className="text-sm text-zinc-500">No posts yet.</div>
         ) : (
           <div className="grid grid-cols-3 gap-2">
-            {posts.map((p) => (
+            {postsByUser.map((p) => (
               <div
                 key={p.id}
                 className="aspect-square rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900"
               >
-                {p.media[0] ? (
+                {p.media_urls?.[0] ? (
                   <img
-                    src={p.media[0]}
+                    src={p.media_urls[0]}
                     alt="post"
                     className="w-full h-full object-cover"
                     loading="lazy"
@@ -819,60 +855,54 @@ function ProfileScreen({
 // Stories Tray
 // ---------------------------
 function StoriesTray({
-  state,
+  stories,
+  users,
+  me,
   onOpenProfile,
 }: {
-  state: State;
+  stories: Story[];
+  users: Record<string, User>;
+  me: User;
   onOpenProfile: (id: string) => void;
 }) {
-  // stories are pruned by App effect; this is a simple render
-  const stories: Story[] = useMemo(
-    () => state.stories.filter((s: Story) => s.expiresAt > Date.now()),
-    [state.stories]
+  const filteredStories: Story[] = useMemo(
+    () => stories.filter((s) => new Date(s.expires_at).getTime() > Date.now()),
+    [stories]
   );
-
   return (
     <div className="flex gap-3 overflow-x-auto py-3">
       {[
-        {
-          id: "self",
-          userId: state.me.id,
-          url: "",
-          createdAt: now(),
-          expiresAt: now() + 86_400_000,
-        } as Story,
-        ...stories,
+        { id: "self", author_id: me.id, media_url: "" } as Story,
+        ...filteredStories,
       ].map((s, i) => (
         <button
           key={s.id + String(i)}
           className="text-center flex-shrink-0"
-          onClick={() => onOpenProfile(s.userId)}
+          onClick={() => onOpenProfile(s.author_id)}
           aria-label={`Open ${
-            s.userId === state.me.id
+            s.author_id === me.id
               ? "your"
-              : state.users[s.userId]?.name || "user"
+              : users[s.author_id]?.name || "user"
           } profile`}
         >
           <div className="w-[70px] h-[70px] rounded-full p-[3px] bg-gradient-to-tr from-emerald-400 via-blue-400 to-pink-400">
             <div className="w-full h-full rounded-full bg-white dark:bg-zinc-950 border-2 border-white dark:border-zinc-950 overflow-hidden grid place-items-center">
-              {s.url ? (
+              {s.media_url ? (
                 <img
-                  src={s.url}
+                  src={s.media_url}
                   alt="story"
                   className="w-full h-full object-cover"
                   loading="lazy"
                 />
               ) : (
                 <span className="text-xl">
-                  {(state.users[s.userId]?.name || "U")[0]}
+                  {(users[s.author_id]?.name || me.name)[0]}
                 </span>
               )}
             </div>
           </div>
           <div className="text-xs text-zinc-500 mt-1 w-[70px] truncate">
-            {s.userId === state.me.id
-              ? "Your story"
-              : state.users[s.userId]?.name}
+            {s.author_id === me.id ? "Your story" : users[s.author_id]?.name}
           </div>
         </button>
       ))}
@@ -906,14 +936,14 @@ function PostCard({
         <div className="leading-tight">
           <div className="font-medium">{user.name}</div>
           <div className="text-xs text-zinc-500">
-            {user.handle} · {timeAgo(post.createdAt)}
+            {user.handle} · {timeAgo(post.created_at)}
           </div>
         </div>
       </div>
       <div className="mt-3 whitespace-pre-wrap">{linkify(post.text)}</div>
-      {post.media?.length > 0 && (
+      {post.media_urls?.length > 0 && (
         <div className="flex gap-2 flex-wrap mt-3">
-          {post.media.map((src, i) => (
+          {post.media_urls.map((src, i) => (
             <img
               key={i}
               src={src}
@@ -952,7 +982,7 @@ function PostCard({
         >
           💬 <span className="ml-1">{formatCount(post.comments)}</span>
         </button>
-        <div className="ml-auto text-xs">ID {post.id.slice(-4)}</div>
+        <div className="ml-auto text-xs">ID {post.id.slice(0, 4)}...</div>
       </div>
     </article>
   );
@@ -983,9 +1013,9 @@ function Avatar({
         <div
           className={`rounded-full grid place-items-center bg-white/90 dark:bg-zinc-950/90 overflow-hidden ${innerSizeClass}`}
         >
-          {user.avatar ? (
+          {user.avatar_url ? (
             <img
-              src={user.avatar}
+              src={user.avatar_url}
               alt={user.name}
               className="w-full h-full object-cover"
               loading="lazy"
@@ -1033,59 +1063,10 @@ function linkify(text: string) {
   );
 }
 function readAsDataURL(file: File) {
-  // Correct JS single-line comment syntax used here (//), avoiding # which is invalid in JS/TS.
   return new Promise<string>((res, rej) => {
     const fr = new FileReader();
-    fr.onload = () => res(String(fr.result)); // The error was previously thrown near here due to invalid comment syntax.
+    fr.onload = () => res(String(fr.result));
     fr.onerror = rej;
     fr.readAsDataURL(file);
   });
-}
-
-// ---------------------------
-// Self-tests (runtime, non-blocking)
-// ---------------------------
-function runSelfTests() {
-  try {
-    console.groupCollapsed("Fuse self-tests");
-    // clamp
-    console.assert(clamp(5, 0, 10) === 5, "clamp middle failed");
-    console.assert(clamp(-1, 0, 10) === 0, "clamp low failed");
-    console.assert(clamp(99, 0, 10) === 10, "clamp high failed");
-    // timeAgo
-    const t0 = Date.now() - 5 * 1000; // ~5s ago
-    console.assert(/^\d+s$/.test(timeAgo(t0)), "timeAgo seconds format");
-    // linkify basics (http + unicode hashtag)
-    const parts = "Hi #тест https://example.com and #tag_1".split(
-      /(https?:\/\/\S+|#[\p{L}0-9_]+)/gu
-    );
-    console.assert(
-      parts.length >= 5,
-      "linkify split parts (unicode + underscore)"
-    );
-    console.assert(/#[\p{L}0-9_]+/u.test("#тест"), "unicode hashtag passes");
-    // score monotonicity sanity (more likes -> >= score)
-    const a: Post = {
-      id: "a",
-      userId: "u1",
-      text: "",
-      media: [],
-      likes: 0,
-      recasts: 0,
-      comments: 0,
-      createdAt: Date.now(),
-    };
-    const b: Post = { ...a, id: "b", likes: 10 };
-    const scoreFn = (p: Post) => {
-      const ageH = (Date.now() - p.createdAt) / 3_600_000;
-      const engagement = p.likes * 2 + p.recasts * 3 + p.comments;
-      return engagement + clamp(12 - ageH, 0, 12);
-    };
-    console.assert(scoreFn(b) >= scoreFn(a), "score monotonicity by likes");
-
-    console.log("All assertions passed");
-    console.groupEnd();
-  } catch (e) {
-    console.error("Self-tests error", e);
-  }
 }
