@@ -206,7 +206,7 @@ export default function App() {
             onLikeRecast={fetchLikesAndRecasts}
           />
         ) : (
-          <ProfileScreen me={me} posts={allPosts} users={allUsers} userId={route.userId} onBack={openFeed} onOpenProfile={openProfile} following={following} onFollowChange={fetchFollowing} onUpdatePfp={() => fetchUserData(me.id)}/>
+          <ProfileScreen me={me} posts={allPosts} users={allUsers} userId={route.userId} onBack={openFeed} onOpenProfile={openProfile} following={following} onFollowChange={fetchFollowing} />
         )}
       </div>
     </div>
@@ -357,22 +357,15 @@ function FeedScreen({ me, posts, users, stories, likes, recasts, following, sear
   const onDragLeave = () => setIsDragging(false);
 
   async function publish(kind: "post" | "story") {
-    if (kind === "post" && !text.trim() && media.length === 0) {
-      alert("Write something or add a photo.");
-      return;
-    }
-    if (kind === "story" && media.length === 0) {
-      alert("Please add a photo for your story.");
-      return;
-    }
+    if (!text.trim() && media.length === 0) return alert("Write something or add a photo.");
 
     const mediaUrls: string[] = [];
     if (media.length > 0) {
       for (const file of media) {
         const filePath = `${me.id}/${uid()}-${file.name}`;
-        const { error: uploadError } = await supabase.storage.from('media').upload(filePath, file);
-        if (uploadError) {
-          console.error("Error uploading media:", uploadError);
+        const { data, error } = await supabase.storage.from('media').upload(filePath, file);
+        if (error) {
+          console.error("Error uploading media:", error);
           return;
         }
         const { data: { publicUrl } } = supabase.storage.from('media').getPublicUrl(filePath);
@@ -380,20 +373,21 @@ function FeedScreen({ me, posts, users, stories, likes, recasts, following, sear
       }
     }
 
-    if (kind === "post") {
-      const { error: postError } = await supabase
-        .from('posts')
-        .insert({
-          user_id: me.id,
-          text: text.slice(0, 500),
-          media_urls: mediaUrls,
-          created_at: new Date().toISOString()
-        });
-      
-      if (postError) {
-        console.error("Error creating post:", postError);
-      }
-    } else if (kind === "story") {
+    const { error: postError } = await supabase
+      .from('posts')
+      .insert({
+        user_id: me.id,
+        text: text.slice(0, 500),
+        media_urls: mediaUrls,
+        created_at: new Date().toISOString()
+      });
+    
+    if (postError) {
+      console.error("Error creating post:", postError);
+      return;
+    }
+
+    if (kind === "story" && mediaUrls.length > 0) {
       const { error: storyError } = await supabase
         .from('stories')
         .insert({
@@ -475,15 +469,9 @@ function FeedScreen({ me, posts, users, stories, likes, recasts, following, sear
                 <span className={`text-xs ${overLimit ? "text-red-500" : "text-zinc-500"}`}>{Math.min(text.length, 999)}/500</span>
               </div>
               <div className="flex gap-2">
-                <label className="cursor-pointer px-3 py-2 rounded-full border border-zinc-300 dark:border-zinc-700">
-                  <input type="file" accept="image/*" className="hidden" onChange={(e) => {
-                    if (e.target.files?.length) {
-                      setMedia(Array.from(e.target.files));
-                      publish("story");
-                    }
-                  }} />
+                <button onClick={() => publish("story")} className="px-3 py-2 rounded-full border border-zinc-300 dark:border-zinc-700">
                   Add to Story
-                </label>
+                </button>
                 <button onClick={() => publish("post")} className="px-4 py-2 rounded-full bg-blue-600 text-white" disabled={overLimit}>
                   Post
                 </button>
@@ -518,7 +506,7 @@ function FeedScreen({ me, posts, users, stories, likes, recasts, following, sear
 // ---------------------------
 // Profile Screen (separate view)
 // ---------------------------
-function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, following, onFollowChange, onUpdatePfp }: { me: User; posts: Post[]; users: Record<string, User>; userId: string; onBack: () => void; onOpenProfile: (id: string) => void; following: string[]; onFollowChange: (userId: string) => void; onUpdatePfp: () => void; }) {
+function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, following, onFollowChange }: { me: User; posts: Post[]; users: Record<string, User>; userId: string; onBack: () => void; onOpenProfile: (id: string) => void; following: string[]; onFollowChange: (userId: string) => void }) {
   const user = users[userId] || me;
   const isMe = userId === me.id;
   const userPosts = posts.filter((p: Post) => p.userId === userId);
@@ -568,21 +556,6 @@ function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, follow
     }
   };
 
-  const handlePfpChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const filePath = `${me.id}/avatar-${uid()}`;
-      const { data, error } = await supabase.storage.from('media').upload(filePath, file, { upsert: true });
-      if (error) {
-        console.error("Error uploading avatar:", error);
-        return;
-      }
-      const { data: { publicUrl } } = supabase.storage.from('media').getPublicUrl(filePath);
-      await supabase.from('users').update({ avatar_url: publicUrl }).eq('id', me.id);
-      onUpdatePfp();
-    }
-  };
-
   const toggleFollow = async () => {
     const isFollowing = following.includes(userId);
     if (isFollowing) {
@@ -609,15 +582,7 @@ function ProfileScreen({ me, posts, users, userId, onBack, onOpenProfile, follow
       {/* Header */}
       <div className="bg-white dark:bg-zinc-900 rounded-3xl border border-zinc-200 dark:border-zinc-800 p-6">
         <div className="flex items-center gap-4">
-          <div className="relative">
-            <Avatar size={72} user={user} onClick={() => {}} />
-            {isMe && (
-              <label className="absolute bottom-0 right-0 w-8 h-8 rounded-full bg-blue-600 text-white grid place-items-center cursor-pointer">
-                <input type="file" accept="image/*" className="hidden" onChange={handlePfpChange} />
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M14.93 16.2c-.41 0-.74.33-.74.74v2.52c0 .41.33.74.74.74h2.52c.41 0 .74-.33.74-.74v-2.52c0-.41-.33-.74-.74-.74h-2.52Zm.76-13.43c.12-.12.29-.19.47-.19.18 0 .35.07.47.19.24.24.24.62 0 .86l-1.39 1.4-1.33-1.33 1.39-1.4Zm-7.14 0c-.24-.24-.62-.24-.86 0L5.35 4.02l1.33 1.33 1.39-1.4c.24-.24.24-.62 0-.86Zm12.1 16.8c-.37 0-.67.3-.67.67v2.01c0 .37.3.67.67.67h2.01c.37 0 .67-.3.67-.67v-2.01c0-.37-.3-.67-.67-.67h-2.01ZM18.5 24h-13c-.83 0-1.5-.67-1.5-1.5v-13c0-.83.67-1.5 1.5-1.5h13c.83 0 1.5.67 1.5 1.5v13c0 .83-.67 1.5-1.5 1.5Zm-13-14.5c0-.28.22-.5.5-.5h2c.28 0 .5.22.5.5v2c0 .28-.22.5-.5.5h-2c-.28 0-.5-.22-.5-.5v-2Zm0-4.5c0-.28.22-.5.5-.5h2c.28 0 .5.22.5.5v2c0 .28-.22.5-.5.5h-2c-.28 0-.5-.22-.5-.5v-2Zm4.5 4.5c0-.28.22-.5.5-.5h2c.28 0 .5.22.5.5v2c0 .28-.22.5-.5.5h-2c-.28 0-.5-.22-.5-.5v-2Zm0-4.5c0-.28.22-.5.5-.5h2c.28 0 .5.22.5.5v2c0 .28-.22.5-.5.5h-2c-.28 0-.5-.22-.5-.5v-2Zm9-2c-.28 0-.5.22-.5.5v2c0 .28.22.5.5.5h2c.28 0 .5-.22.5-.5v-2c0-.28-.22-.5-.5-.5h-2Z"/></svg>
-              </label>
-            )}
-          </div>
+          <Avatar size={72} user={user} onClick={() => {}} />
           <div className="flex-1">
             <div className="text-xl font-semibold">{user.name}</div>
             <div className="text-zinc-500">{user.handle}</div>
@@ -754,7 +719,6 @@ function StoriesTray({ stories, users, me, onOpenProfile }: { stories: Story[]; 
         <button key={s.id} className="text-center flex-shrink-0" onClick={() => onOpenProfile(s.userId)} aria-label={`Open ${users[s.userId]?.name || "user"} profile`}>
           <div className="w-[70px] h-[70px] rounded-full p-[3px] bg-gradient-to-tr from-emerald-400 via-blue-400 to-pink-400">
             <div className="w-full h-full rounded-full bg-white dark:bg-zinc-950 border-2 border-white dark:border-zinc-950 overflow-hidden grid place-items-center">
-              {/* @ts-ignore */}
               {s.media_url ? <img src={s.media_url} alt="story" className="w-full h-full object-cover" loading="lazy" /> : <span className="text-xl">{(users[s.userId]?.name || "U")[0]}</span>}
             </div>
           </div>
@@ -769,22 +733,6 @@ function StoriesTray({ stories, users, me, onOpenProfile }: { stories: Story[]; 
 // Post Card
 // ---------------------------
 function PostCard({ post, user, me, liked, recasted, onToggle, onOpenProfile }: { post: Post; user: User; me: User; liked: boolean; recasted: boolean; onToggle: (act: "like" | "recast" | "comment") => void; onOpenProfile: (id: string) => void }) {
-  const handleShare = async () => {
-    if (navigator.share) {
-      try {
-        await navigator.share({
-          title: `Post by ${user.name}`,
-          text: post.text,
-          url: window.location.href, // You would replace this with the specific post URL
-        });
-      } catch (error) {
-        console.error('Error sharing:', error);
-      }
-    } else {
-      alert("Web Share API is not supported in this browser.");
-    }
-  };
-
   return (
     <article className="bg-white dark:bg-zinc-900 rounded-3xl border border-zinc-200 dark:border-zinc-800 p-4 my-4">
       <div className="flex items-center gap-3">
@@ -811,9 +759,6 @@ function PostCard({ post, user, me, liked, recasted, onToggle, onOpenProfile }: 
         </button>
         <button onClick={() => onToggle("comment")} className="px-2 py-1 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800" aria-label="Comment">
           💬 <span className="ml-1">{formatCount(post.comments)}</span>
-        </button>
-        <button onClick={handleShare} className="px-2 py-1 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800" aria-label="Share">
-          ↗️
         </button>
         <div className="ml-auto text-xs">ID {post.id.slice(-4)}</div>
       </div>
