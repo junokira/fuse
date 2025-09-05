@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { createClient, User as SupabaseUser } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.44.2/+esm";
+import { createClient, User as SupabaseUser } from "@supabase/supabase-js";
 
 // Supabase configuration
 const SUPABASE_URL = "YOUR_SUPABASE_URL_HERE";
@@ -31,6 +31,7 @@ export type Story = {
   id: string;
   author_id: string;
   media_url: string;
+  expires_at?: string;
   created_at: string;
 };
 
@@ -68,7 +69,6 @@ const safeLinkProps = { target: "_blank", rel: "noopener noreferrer" } as const;
 // App
 // ---------------------------
 export default function App() {
-  const [supabaseUser, setSupabaseUser] = useState<SupabaseUser | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [me, setMe] = useState<User | null>(null);
   const [posts, setPosts] = useState<Post[]>([]);
@@ -93,15 +93,12 @@ export default function App() {
       setIsLoading(true);
 
       const { data: authData } = await supabase.auth.signInAnonymously();
-      setSupabaseUser(authData.user);
 
       // Fetch users
-      const { data: userData, error: userError } = await supabase
-        .from("profiles")
-        .select("*");
+      const { data: userData } = await supabase.from("profiles").select("*");
       if (userData) {
         setUsers(userData);
-        const myProfile = userData.find((u) => u.id === authData.user?.id);
+        const myProfile = userData.find((u: User) => u.id === authData.user?.id);
         if (myProfile) {
           setMe(myProfile);
         } else {
@@ -136,19 +133,19 @@ export default function App() {
           .select("followed_id")
           .eq("follower_id", authData.user.id);
         if (followingData)
-          setFollowingIds(followingData.map((f) => f.followed_id));
+          setFollowingIds(followingData.map((f: { followed_id: string }) => f.followed_id));
 
         const { data: likesData } = await supabase
           .from("post_likes")
           .select("post_id")
           .eq("user_id", authData.user.id);
-        if (likesData) setLikedPosts(likesData.map((l) => l.post_id));
+        if (likesData) setLikedPosts(likesData.map((l: { post_id: string }) => l.post_id));
 
         const { data: recastsData } = await supabase
           .from("post_recasts")
           .select("post_id")
           .eq("user_id", authData.user.id);
-        if (recastsData) setRecastedPosts(recastsData.map((r) => r.post_id));
+        if (recastsData) setRecastedPosts(recastsData.map((r: { post_id: string }) => r.post_id));
       }
 
       setIsLoading(false);
@@ -222,7 +219,7 @@ export default function App() {
             setFollowingIds={setFollowingIds}
             userId={route.userId}
             onBack={openFeed}
-            onOpenProfile={openProfile}
+            onOpenProfile={onOpenProfile}
           />
         )}
       </div>
@@ -402,7 +399,7 @@ function FeedScreen({
         text: text.slice(0, 500),
         media_urls: images,
       };
-      const { data, error } = await supabase.from("posts").insert(newPost).select();
+      const { data } = await supabase.from("posts").insert(newPost).select();
       if (data) setPosts((p) => [...data, ...p]);
     } else {
       const newStory = {
@@ -410,7 +407,7 @@ function FeedScreen({
         media_url: images[0] || placeholderImg(me.name),
         expires_at: new Date(Date.now() + 86400000).toISOString(),
       };
-      const { data, error } = await supabase.from("stories").insert(newStory).select();
+      const { data } = await supabase.from("stories").insert(newStory).select();
       if (data) setStories((s) => [...data, ...s]);
     }
     setText("");
@@ -463,7 +460,7 @@ function FeedScreen({
       if (act === "recast") toggleRecast(postId);
       // comment logic not implemented in this demo
     },
-    [likedPosts, recastedPosts]
+    [likedPosts, recastedPosts, toggleLike, toggleRecast]
   );
 
   const overLimit = text.length > 500;
@@ -607,7 +604,7 @@ function FeedScreen({
             me={me}
             liked={likedPosts.includes(p.id)}
             recasted={recastedPosts.includes(p.id)}
-            onToggle={toggle}
+            onToggle={(act: "like" | "recast" | "comment") => toggle(p.id, act)}
             onOpenProfile={onOpenProfile}
           />
         ))}
@@ -696,7 +693,7 @@ function ProfileScreen({
       </div>
       <div className="bg-white dark:bg-zinc-900 rounded-3xl border border-zinc-200 dark:border-zinc-800 p-6">
         <div className="flex items-center gap-4">
-          <Avatar size={72} user={user} onClick={() => onOpenProfile(user.id)} />
+          <Avatar user={user} onClick={() => onOpenProfile(user.id)} />
           <div className="flex-1">
             <div className="text-xl font-semibold">{user.name}</div>
             <div className="text-zinc-500">{user.handle}</div>
@@ -866,7 +863,7 @@ function StoriesTray({
   onOpenProfile: (id: string) => void;
 }) {
   const filteredStories: Story[] = useMemo(
-    () => stories.filter((s) => new Date(s.expires_at).getTime() > Date.now()),
+    () => stories.filter((s) => s.expires_at && new Date(s.expires_at).getTime() > Date.now()),
     [stories]
   );
   return (
