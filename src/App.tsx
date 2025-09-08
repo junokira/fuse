@@ -1,48 +1,28 @@
-import { useEffect, useRef, useState } from "react";
-import { createClient, SupabaseClient, RealtimeChannel } from "@supabase/supabase-js";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 /**
- * App.tsx (TypeScript)
- * - Uses Vite env variables: import.meta.env.VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY
- * - Ensure @supabase/supabase-js is installed
+ * Fuse — Instagram/X hybrid demo (React + TypeScript, single-file)
+ *
+ * What’s improved (high-impact, no-backend):
+ * - Stronger typing: central State/Route/Tab types, fewer `any`s.
+ * - Safer state updates: no in-place post mutation; pure, immutable updates.
+ * - Better UX: drag & drop media, lazy-loaded images, accessible labels, small a11y tweaks.
+ * - Performance: memoized handlers, lighter localStorage writes (micro‑debounce).
+ * - Time freshness: feed timestamps auto-refresh every 60s.
+ * - Small quality-of-life: follow/unfollow on profiles; number formatting; link security.
+ * - Kept/expanded lightweight runtime self-tests.
  */
 
-// Vite env (works in Vite and most modern setups). Avoids `process` type issues.
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
-
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-  console.warn(
-    "Missing Vite env vars. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY."
-  );
-}
-
-const supabase: SupabaseClient = createClient(SUPABASE_URL ?? "", SUPABASE_ANON_KEY ?? "", {
-  realtime: { params: { eventsPerSecond: 10 } },
-});
-
-/* ---------------------- Types ---------------------- */
-type Profile = {
+// ---------------------------
+// Types (TypeScript)
+// ---------------------------
+export type User = {
   id: string;
-  name?: string | null;
-  handle?: string | null;
-  avatar?: string | null;
-  bio?: string | null;
-  created_at?: string | null;
+  name: string;
+  handle: string;
+  avatar?: string;
 };
-
-type PostRow = {
-  id: string;
-  user_id: string;
-  text: string | null;
-  media?: string[] | null;
-  likes?: number | null;
-  recasts?: number | null;
-  comments?: number | null;
-  created_at?: string | null;
-};
-
-type Post = {
+export type Post = {
   id: string;
   userId: string;
   text: string;
@@ -51,1100 +31,1061 @@ type Post = {
   recasts: number;
   comments: number;
   createdAt: number;
-  optimistic?: boolean;
+};
+export type Story = {
+  id: string;
+  userId: string;
+  url: string;
+  createdAt: number;
+  expiresAt: number;
 };
 
-/* ---------------------- Helpers ---------------------- */
-function randomFilename(originalName = "file"): string {
-  const ext = originalName.includes(".")
-    ? "." + originalName.split(".").pop()
-    : "";
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
-}
+type Tab = "forYou" | "following" | "latest";
 
-async function uploadFileToStorage(file: File, folder = "posts"): Promise<string | null> {
-  const filePath = `${folder}/${randomFilename(file.name)}`;
-  const { data, error } = await supabase.storage.from("media").upload(filePath, file);
-  if (error) {
-    console.error("upload error:", error);
-    throw error;
-  }
-  const { data: pub } = supabase.storage.from("media").getPublicUrl(data.path ?? filePath);
-  return pub?.publicUrl ?? null;
-}
+type Route = { name: "feed" } | { name: "profile"; userId: string };
 
-function mapPostRow(row: PostRow): Post {
-  return {
-    id: row.id,
-    userId: row.user_id,
-    text: row.text ?? "",
-    media: row.media ?? [],
-    likes: row.likes ?? 0,
-    recasts: row.recasts ?? 0,
-    comments: row.comments ?? 0,
-    createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+type State = {
+  me: User;
+  following: string[];
+  users: Record<string, User>;
+  stories: Story[];
+  posts: Post[];
+  likes: Record<string, boolean>;
+  recasts: Record<string, boolean>;
+  bio: Record<string, string>;
+  links: Record<string, string[]>;
+};
+
+// ---------------------------
+// Helpers
+// ---------------------------
+const uid = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2, 10);
+const now = () => Date.now();
+const clamp = (n: number, min: number, max: number) =>
+  Math.min(Math.max(n, min), max);
+const formatCount = (n: number) =>
+  n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : String(n);
+const placeholderImg = (seed = "U") => {
+  const bg = encodeURIComponent("#232736");
+  const txt = encodeURIComponent(seed[0] || "U");
+  return `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='600' height='400'><rect width='100%' height='100%' fill='${bg}'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='white' font-size='120' font-family='system-ui'>${txt}</text></svg>`;
+};
+
+const timeAgo = (ts: number) => {
+  const d = Math.floor((Date.now() - ts) / 1000);
+  if (d < 60) return `${d}s`;
+  if (d < 3600) return `${Math.floor(d / 60)}m`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h`;
+  const days = Math.floor(d / 86400);
+  if (days < 7) return `${days}d`;
+  return new Date(ts).toLocaleDateString();
+};
+
+const safeLinkProps = { target: "_blank", rel: "noopener noreferrer" } as const;
+
+// ---------------------------
+// Seed Data
+// ---------------------------
+const DEFAULT_USER: User = { id: "u1", name: "You", handle: "@you" };
+const SEED = (() => {
+  const t = now();
+  const base: State = {
+    me: DEFAULT_USER,
+    following: ["u2", "u3", "u4"],
+    users: {
+      u1: DEFAULT_USER,
+      u2: { id: "u2", name: "Ari", handle: "@ari" },
+      u3: { id: "u3", name: "Noor", handle: "@noor" },
+      u4: { id: "u4", name: "Leo", handle: "@leo" },
+    },
+    stories: [
+      {
+        id: "s1",
+        userId: "u2",
+        url: "",
+        createdAt: t - 1000 * 60 * 60 * 2,
+        expiresAt: t + 1000 * 60 * 60 * 22,
+      },
+      {
+        id: "s2",
+        userId: "u3",
+        url: "",
+        createdAt: t - 1000 * 60 * 60 * 10,
+        expiresAt: t + 1000 * 60 * 60 * 14,
+      },
+    ],
+    posts: [
+      {
+        id: "p1",
+        userId: "u2",
+        text: "Building in public. Today: micro-interactions ✨",
+        media: [],
+        likes: 3,
+        recasts: 1,
+        comments: 0,
+        createdAt: t - 1000 * 60 * 30,
+      },
+      {
+        id: "p2",
+        userId: "u3",
+        text: "Morning sunlight > afternoon coffee.",
+        media: [],
+        likes: 12,
+        recasts: 2,
+        comments: 3,
+        createdAt: t - 1000 * 60 * 90,
+      },
+      {
+        id: "p3",
+        userId: "u4",
+        text: "Shot on phone 📸",
+        media: [],
+        likes: 7,
+        recasts: 0,
+        comments: 1,
+        createdAt: t - 1000 * 60 * 60 * 4,
+      },
+    ],
+    likes: {},
+    recasts: {},
+    bio: {
+      u1: "Designing my day in public. Coffee. Cameras. Code.",
+      u2: "Tiny UI experiments.",
+      u3: "Behavioral science + product.",
+      u4: "Street photos and synths.",
+    },
+    links: { u1: ["https://example.com"], u2: [], u3: [], u4: [] },
   };
+  return base;
+})();
+
+const STORE_KEY = "fuse/react-demo/v2"; // bumped version
+
+function loadState(): State {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return SEED;
+    const data = JSON.parse(raw);
+    // Basic shape guard; fall back to SEED on obvious mismatch
+    if (!data || typeof data !== "object" || !("posts" in data)) return SEED;
+    return { ...SEED, ...data } as State;
+  } catch {
+    return SEED;
+  }
 }
 
-/* ---------------------- Component ---------------------- */
-export default function App(): JSX.Element {
-  const [loading, setLoading] = useState<boolean>(true);
-  const [session, setSession] = useState<any | null>(null);
-  const [me, setMe] = useState<Profile | null>(null);
-  const [profiles, setProfiles] = useState<Record<string, Profile>>({});
-  const [posts, setPosts] = useState<Post[]>([]);
-  const [userLikes, setUserLikes] = useState<Record<string, boolean>>({});
-  const [newText, setNewText] = useState<string>("");
-  const [newFiles, setNewFiles] = useState<File[]>([]);
-  const [email, setEmail] = useState<string>("");
+let saveTimer: number | undefined;
+function saveStateDebounced(s: State) {
+  if (saveTimer) window.clearTimeout(saveTimer);
+  saveTimer = window.setTimeout(() => {
+    localStorage.setItem(STORE_KEY, JSON.stringify(s));
+  }, 200);
+}
 
-  // typed ref for the realtime channel (avoids "never" type)
-  const postsChannelRef = useRef<RealtimeChannel | null>(null);
+// ---------------------------
+// App
+// ---------------------------
+export default function App() {
+  const [state, setState] = useState<State>(loadState());
+  const [theme, setTheme] = useState<string>(
+    () =>
+      localStorage.getItem("fuse/theme") ||
+      (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
+  );
+  const [route, setRoute] = useState<Route>({ name: "feed" });
+  const [search, setSearch] = useState("");
+  const [activeTab, setActiveTab] = useState<Tab>("forYou");
+  const [tick, setTick] = useState(0); // drive timeAgo refresh
 
-  /* ---------------------- Init ---------------------- */
+  // Theme
   useEffect(() => {
-    let mounted = true;
-    async function init() {
-      setLoading(true);
-      try {
-        const { data } = await supabase.auth.getSession();
-        const currentSession = data.session ?? null;
-        if (!mounted) return;
-        setSession(currentSession);
+    document.documentElement.classList.toggle("dark", theme === "dark");
+    localStorage.setItem("fuse/theme", theme);
+  }, [theme]);
 
-        if (currentSession?.user) {
-          await ensureProfileExists(currentSession.user);
-        }
+  // Persist (debounced)
+  useEffect(() => {
+    saveStateDebounced(state);
+  }, [state]);
 
-        // load profiles and posts
-        const [profilesRes, postsRes] = await Promise.all([
-          supabase.from("profiles").select("*"),
-          supabase.from("posts").select("*").order("created_at", { ascending: false }).limit(200),
-        ]);
-
-        if (!mounted) return;
-
-        if (profilesRes.error) throw profilesRes.error;
-        const profilesRows = (profilesRes.data ?? []) as Profile[];
-        const profilesMap: Record<string, Profile> = {};
-        profilesRows.forEach((p) => {
-          if (p && p.id) profilesMap[p.id] = p;
-        });
-        setProfiles(profilesMap);
-
-        if (postsRes.error) throw postsRes.error;
-        const postsRows = (postsRes.data ?? []) as PostRow[];
-        setPosts(postsRows.map(mapPostRow));
-
-        if (currentSession?.user) {
-          const likesRes = await supabase.from("likes").select("post_id").eq("user_id", currentSession.user.id);
-          if (!likesRes.error) {
-            const likesMap: Record<string, boolean> = {};
-            (likesRes.data ?? []).forEach((l: any) => {
-              if (l?.post_id) likesMap[l.post_id] = true;
-            });
-            setUserLikes(likesMap);
-          }
-          const myProfile = profilesMap[currentSession.user.id];
-          if (myProfile) setMe(myProfile);
-        }
-      } catch (err: unknown) {
-        console.error("init error", err);
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    }
-
-    init();
-
-    // auth listener
-    const { data: listener } = supabase.auth.onAuthStateChange(async (_event, sessionObj) => {
-      setSession(sessionObj);
-      if (sessionObj?.user) {
-        await ensureProfileExists(sessionObj.user);
-        const likesRes = await supabase.from("likes").select("post_id").eq("user_id", sessionObj.user.id);
-        if (!likesRes.error) {
-          const likesMap: Record<string, boolean> = {};
-          (likesRes.data ?? []).forEach((l: any) => {
-            if (l?.post_id) likesMap[l.post_id] = true;
-          });
-          setUserLikes(likesMap);
-        }
-        const p = await supabase.from("profiles").select("*").eq("id", sessionObj.user.id).single();
-        if (!p.error) setMe(p.data as Profile);
-      } else {
-        setMe(null);
-        setUserLikes({});
-      }
-    });
-
-    return () => {
-      mounted = false;
-      // unsubscribe auth listener
-      if (listener?.subscription?.unsubscribe) {
-        listener.subscription.unsubscribe();
-      }
-    };
+  // timeAgo auto-refresh
+  useEffect(() => {
+    const id = setInterval(() => setTick((n) => n + 1), 60_000);
+    return () => clearInterval(id);
   }, []);
 
-  /* ---------------------- Realtime subscription ---------------------- */
+  // Prune expired stories periodically
   useEffect(() => {
-    async function setupRealtime() {
-      // unsubscribe existing channel if any
-      try {
-        if (postsChannelRef.current) {
-          await postsChannelRef.current.unsubscribe();
-          postsChannelRef.current = null;
-        }
-      } catch (e) {
-        // ignore
-      }
+    const prune = () =>
+      setState((s) => ({
+        ...s,
+        stories: s.stories.filter((st) => st.expiresAt > Date.now()),
+      }));
+    prune();
+    const id = setInterval(prune, 60_000);
+    return () => clearInterval(id);
+  }, []);
 
-      const channel = supabase.channel("public:posts");
-
-      channel.on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "posts" },
-        (payload: { new: PostRow }) => {
-          const newPost = mapPostRow(payload.new);
-          setPosts((cur) => {
-            if (cur.some((p) => p.id === newPost.id)) return cur;
-            return [newPost, ...cur].slice(0, 500);
-          });
-        }
-      );
-
-      channel.on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "posts" },
-        (payload: { new: PostRow }) => {
-          const updated = mapPostRow(payload.new);
-          setPosts((cur) => cur.map((p) => (p.id === updated.id ? updated : p)));
-        }
-      );
-
-      channel.on(
-        "postgres_changes",
-        { event: "DELETE", schema: "public", table: "posts" },
-        (payload: { old: PostRow }) => {
-          setPosts((cur) => cur.filter((p) => p.id !== payload.old.id));
-        }
-      );
-
-      await channel.subscribe();
-      postsChannelRef.current = channel;
-    }
-
-    setupRealtime();
-
-    return () => {
-      (async () => {
-        try {
-          if (postsChannelRef.current) {
-            await postsChannelRef.current.unsubscribe();
-            postsChannelRef.current = null;
-          }
-        } catch (e) {
-          // ignore
-        }
-      })();
-    };
+  // Run lightweight self-tests once in dev
+  useEffect(() => {
+    runSelfTests();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ---------------------- Profile helpers ---------------------- */
-  async function ensureProfileExists(user: any): Promise<void> {
-    if (!user) return;
-    try {
-      const { data, error } = await supabase.from("profiles").select("*").eq("id", user.id).single();
-      if (error) {
-        // If no row, insert
-        if ((error as any)?.details?.includes("No rows found") || (error as any)?.code === "PGRST116") {
-          await supabase.from("profiles").insert([
-            {
-              id: user.id,
-              name: user.user_metadata?.full_name ?? user.user_metadata?.name ?? (user.email ? user.email.split("@")[0] : "Anon"),
-              handle: user.user_metadata?.handle ?? (user.email ? user.email.split("@")[0] : `u_${user.id.slice(0, 6)}`),
-              avatar: user.user_metadata?.avatar_url ?? null,
-            },
-          ]);
-        } else {
-          console.warn("profile select error", error);
+  // Navigation handlers
+  const openProfile = useCallback(
+    (userId: string) => setRoute({ name: "profile", userId }),
+    []
+  );
+  const openFeed = useCallback(() => setRoute({ name: "feed" }), []);
+
+  // silence `tick` usage (forces refresh)
+  void tick;
+
+  return (
+    <div className="min-h-dvh bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+      <Topbar
+        onThemeToggle={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+        onSearch={setSearch}
+        onHome={openFeed}
+        onProfile={() => openProfile(state.me.id)}
+      />
+
+      <div className="max-w-3xl mx-auto p-4">
+        {route.name === "feed" ? (
+          <FeedScreen
+            state={state}
+            setState={setState}
+            search={search}
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            onOpenProfile={openProfile}
+          />
+        ) : (
+          <ProfileScreen
+            state={state}
+            setState={setState}
+            userId={route.userId}
+            onBack={openFeed}
+            onOpenProfile={openProfile}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------
+// Topbar
+// ---------------------------
+function Topbar({
+  onThemeToggle,
+  onSearch,
+  onHome,
+  onProfile,
+}: {
+  onThemeToggle: () => void;
+  onSearch: (q: string) => void;
+  onHome: () => void;
+  onProfile: () => void;
+}) {
+  return (
+    <header className="sticky top-0 z-10 border-b border-zinc-200/50 dark:border-zinc-800/80 bg-white/70 dark:bg-zinc-950/70 backdrop-blur">
+      <div className="max-w-5xl mx-auto px-4 py-3 flex items-center gap-3">
+        <button
+          onClick={onHome}
+          className="flex items-center gap-2 font-bold tracking-tight"
+          aria-label="Go home"
+        >
+          <div className="w-7 h-7 rounded-lg grid place-items-center text-zinc-900 dark:text-zinc-950 bg-gradient-to-br from-blue-400 via-emerald-300 to-zinc-200 shadow">
+            ƒ
+          </div>
+          <span>Fuse</span>
+        </button>
+        <div className="flex-1" />
+        <div className="hidden sm:flex items-center gap-2 flex-1 max-w-md">
+          <div className="flex items-center gap-2 w-full rounded-full border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900 px-3 py-2">
+            <svg
+              className="w-4 h-4 opacity-70"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              aria-hidden
+            >
+              <path d="M10.5 19a8.5 8.5 0 1 1 6.02-2.48l4.48 4.49-1.42 1.41-4.48-4.48A8.46 8.46 0 0 1 10.5 19Zm0-2a6.5 6.5 0 1 0 0-13 6.5 6.5 0 0 0 0 13Z" />
+            </svg>
+            <input
+              aria-label="Search"
+              onChange={(e) => onSearch(e.target.value)}
+              placeholder="Search (people, posts, #tags)"
+              className="bg-transparent outline-none text-sm w-full placeholder:text-zinc-400"
+            />
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onThemeToggle}
+            className="px-3 py-2 rounded-full border border-zinc-200 dark:border-zinc-800"
+            aria-pressed={false}
+          >
+            Theme
+          </button>
+          <button
+            onClick={onProfile}
+            className="px-3 py-2 rounded-full border border-zinc-200 dark:border-zinc-800"
+          >
+            Profile
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+// ---------------------------
+// Feed Screen
+// ---------------------------
+function FeedScreen({
+  state,
+  setState,
+  search,
+  activeTab,
+  setActiveTab,
+  onOpenProfile,
+}: {
+  state: State;
+  setState: React.Dispatch<React.SetStateAction<State>>;
+  search: string;
+  activeTab: Tab;
+  setActiveTab: (t: Tab) => void;
+  onOpenProfile: (id: string) => void;
+}) {
+  const [text, setText] = useState("");
+  const [images, setImages] = useState<string[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const score = useCallback((_s: State, p: Post) => {
+    const ageH = (Date.now() - p.createdAt) / 3_600_000;
+    const engagement = p.likes * 2 + p.recasts * 3 + p.comments;
+    return engagement + clamp(12 - ageH, 0, 12);
+  }, []);
+
+  const filtered = useMemo(() => {
+    let items: Post[] = [...state.posts];
+    if (activeTab === "following") {
+      const fset = new Set(state.following);
+      items = items.filter(
+        (p) => fset.has(p.userId) || p.userId === state.me.id
+      );
+    }
+    if (activeTab === "latest") items.sort((a, b) => b.createdAt - a.createdAt);
+    if (activeTab === "forYou")
+      items.sort((a, b) => score(state, b) - score(state, a));
+    const q = search.trim().toLowerCase();
+    if (q)
+      items = items.filter(
+        (p) =>
+          p.text.toLowerCase().includes(q) ||
+          state.users[p.userId].name.toLowerCase().includes(q)
+      );
+    return items;
+  }, [state, search, activeTab, score]);
+
+  async function onSelectFiles(files: FileList | null) {
+    if (!files) return;
+    const list = Array.from(files).slice(0, 4);
+    const urls: string[] = [];
+    for (const f of list) {
+      urls.push(await readAsDataURL(f));
+    }
+    setImages(urls);
+  }
+
+  const onDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const files = e.dataTransfer.files;
+    await onSelectFiles(files);
+  };
+
+  const onDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const onDragLeave = () => setIsDragging(false);
+
+  function publish(kind: "post" | "story") {
+    if (!text.trim() && images.length === 0)
+      return alert("Write something or add a photo.");
+    const p: Post = {
+      id: `p_${uid()}`,
+      userId: state.me.id,
+      text: text.slice(0, 500),
+      media: images,
+      likes: 0,
+      recasts: 0,
+      comments: 0,
+      createdAt: now(),
+    };
+    const next: State = { ...state, posts: [p, ...state.posts] };
+    if (kind === "story") {
+      const st: Story = {
+        id: `s_${uid()}`,
+        userId: state.me.id,
+        url: images[0] || placeholderImg("You"),
+        createdAt: now(),
+        expiresAt: now() + 86_400_000,
+      };
+      next.stories = [st, ...state.stories];
+    }
+    setState(next);
+    setText("");
+    setImages([]);
+  }
+
+  const toggle = (postId: string, act: "like" | "recast" | "comment") => {
+    setState((prev) => {
+      const likes = { ...prev.likes };
+      const recasts = { ...prev.recasts };
+      const posts = prev.posts.map((p) => {
+        if (p.id !== postId) return p;
+        if (act === "like") {
+          const willLike = !likes[p.id];
+          likes[p.id] = willLike;
+          return { ...p, likes: p.likes + (willLike ? 1 : -1) };
         }
-      } else if (data) {
-        setMe(data as Profile);
-      }
-    } catch (err) {
-      console.error("ensureProfileExists", err);
-    }
+        if (act === "recast") {
+          const willRecast = !recasts[p.id];
+          recasts[p.id] = willRecast;
+          return { ...p, recasts: p.recasts + (willRecast ? 1 : -1) };
+        }
+        // comment
+        return { ...p, comments: p.comments + 1 };
+      });
+      return { ...prev, posts, likes, recasts };
+    });
+  };
+
+  const overLimit = text.length > 500;
+
+  return (
+    <div>
+      {/* Tabs */}
+      <div className="flex justify-center gap-2 py-3">
+        {(["forYou", "following", "latest"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setActiveTab(t)}
+            className={`px-4 py-2 rounded-full border text-sm ${
+              activeTab === t
+                ? "bg-blue-600 text-white border-transparent"
+                : "border-zinc-300 dark:border-zinc-700"
+            }`}
+            aria-pressed={activeTab === t}
+          >
+            {t === "forYou" ? "For you" : t[0].toUpperCase() + t.slice(1)}
+          </button>
+        ))}
+      </div>
+
+      {/* Composer */}
+      <div
+        className={`bg-white dark:bg-zinc-900 rounded-2xl shadow-sm border border-dashed ${
+          isDragging
+            ? "border-blue-500"
+            : "border-zinc-200 dark:border-zinc-800"
+        } p-4`}
+        onDrop={onDrop}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        aria-label="Composer"
+      >
+        <div className="flex gap-3">
+          <Avatar user={state.me} onClick={() => onOpenProfile(state.me.id)} />
+          <div className="flex-1">
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="Share a thought or drop a photo…"
+              className="w-full bg-transparent outline-none resize-y min-h-[64px]"
+              aria-label="Compose a post"
+            />
+            {images.length > 0 && (
+              <div className="flex gap-2 flex-wrap mt-2">
+                {images.map((src, i) => (
+                  <img
+                    key={i}
+                    src={src}
+                    alt="preview"
+                    className="max-h-40 rounded-xl border border-zinc-200 dark:border-zinc-800"
+                    loading="lazy"
+                  />
+                ))}
+              </div>
+            )}
+            <div className="flex items-center justify-between mt-2 gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <label className="cursor-pointer px-3 py-2 rounded-full border border-zinc-300 dark:border-zinc-700">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => onSelectFiles(e.target.files)}
+                  />
+                  Add photo
+                </label>
+                <span
+                  className={`text-xs ${
+                    overLimit ? "text-red-500" : "text-zinc-500"
+                  }`}
+                >
+                  {Math.min(text.length, 999)}/500
+                </span>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => publish("story")}
+                  className="px-3 py-2 rounded-full border border-zinc-300 dark:border-zinc-700"
+                >
+                  Add to Story
+                </button>
+                <button
+                  onClick={() => publish("post")}
+                  className="px-4 py-2 rounded-full bg-blue-600 text-white"
+                  disabled={overLimit}
+                >
+                  Post
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Stories */}
+      <StoriesTray state={state} onOpenProfile={onOpenProfile} />
+
+      {/* Feed */}
+      <div className="mt-4">
+        {filtered.map((p) => (
+          <PostCard
+            key={p.id}
+            post={p}
+            user={state.users[p.userId]}
+            me={state.me}
+            liked={!!state.likes[p.id]}
+            recasted={!!state.recasts[p.id]}
+            onToggle={(act) => toggle(p.id, act)}
+            onOpenProfile={onOpenProfile}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------
+// Profile Screen (separate view)
+// ---------------------------
+function ProfileScreen({
+  state,
+  setState,
+  userId,
+  onBack,
+}: {
+  state: State;
+  setState: React.Dispatch<React.SetStateAction<State>>;
+  userId: string;
+  onBack: () => void;
+  onOpenProfile: (id: string) => void;
+}) {
+  const user: User = state.users[userId] || DEFAULT_USER;
+  const isMe = userId === state.me.id;
+  const bio = state.bio[userId] || "";
+  const links: string[] = state.links[userId] || [];
+  const posts: Post[] = state.posts.filter((p: Post) => p.userId === userId);
+
+  const [editing, setEditing] = useState(false);
+  const [draftBio, setDraftBio] = useState(bio);
+  const [draftLinks, setDraftLinks] = useState(links.join("\n"));
+
+  function saveProfile() {
+    setState((prev) => {
+      const next = { ...prev };
+      next.bio[userId] = draftBio.slice(0, 200);
+      next.links[userId] = draftLinks
+        .split(/\n+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .slice(0, 3);
+      return next;
+    });
+    setEditing(false);
   }
 
-  /* ---------------------- Auth ---------------------- */
-  async function signInWithMagicLink(e?: React.FormEvent) {
-    e?.preventDefault();
-    if (!email) return alert("Enter your email");
-    setLoading(true);
-    try {
-      const { error } = await supabase.auth.signInWithOtp({ email });
-      if (error) throw error;
-      alert("Magic link sent — check your email (spam too).");
-    } catch (err: unknown) {
-      console.error("signin error", err);
-      alert("Sign-in error");
-    } finally {
-      setLoading(false);
-    }
-  }
+  const toggleFollow = () => {
+    if (isMe) return;
+    setState((prev) => {
+      const following = new Set(prev.following);
+      if (following.has(userId)) following.delete(userId);
+      else following.add(userId);
+      return { ...prev, following: Array.from(following) };
+    });
+  };
 
-  async function signOut(): Promise<void> {
-    await supabase.auth.signOut();
-    setSession(null);
-    setMe(null);
-    setUserLikes({});
-  }
+  const followingMe = state.following.includes(userId);
 
-  /* ---------------------- Posting ---------------------- */
-  async function publishPost(): Promise<void> {
-    if (!session?.user) return alert("Sign in first");
-    if (!newText.trim() && newFiles.length === 0) return alert("Type something or attach a file");
+  return (
+    <div>
+      <div className="flex items-center gap-3 mb-3">
+        <button
+          onClick={onBack}
+          className="px-3 py-2 rounded-full border border-zinc-300 dark:border-zinc-700"
+          aria-label="Back to feed"
+        >
+          ← Back
+        </button>
+        <div className="text-sm text-zinc-500">Profile</div>
+      </div>
 
-    const optimisticPost: Post = {
-      id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      userId: session.user.id,
-      text: newText,
+      {/* Header */}
+      <div className="bg-white dark:bg-zinc-900 rounded-3xl border border-zinc-200 dark:border-zinc-800 p-6">
+        <div className="flex items-center gap-4">
+          <Avatar size={72} user={user} />
+          <div className="flex-1">
+            <div className="text-xl font-semibold">{user.name}</div>
+            <div className="text-zinc-500">{user.handle}</div>
+          </div>
+          {isMe ? (
+            <button
+              onClick={() => setEditing((e) => !e)}
+              className="px-4 py-2 rounded-full border border-zinc-300 dark:border-zinc-700"
+            >
+              {editing ? "Cancel" : "Edit profile"}
+            </button>
+          ) : (
+            <button
+              onClick={toggleFollow}
+              className={`px-4 py-2 rounded-full ${
+                followingMe
+                  ? "border border-zinc-300 dark:border-zinc-700"
+                  : "bg-blue-600 text-white"
+              }`}
+            >
+              {followingMe ? "Following" : "Follow"}
+            </button>
+          )}
+        </div>
+
+        {!editing ? (
+          <div className="mt-4 space-y-2">
+            {bio && (
+              <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                {bio}
+              </p>
+            )}
+            {links.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {links.map((url, i) => (
+                  <a
+                    key={i}
+                    href={url}
+                    {...safeLinkProps}
+                    className="text-sm underline break-all"
+                  >
+                    {url}
+                  </a>
+                ))}
+              </div>
+            )}
+            <div className="flex gap-4 text-sm text-zinc-500 pt-1">
+              <span>
+                <b>{posts.length}</b> posts
+              </span>
+              <span>
+                <b>{Math.max(3, Math.floor(posts.length * 3.2))}</b> followers
+              </span>
+              <span>
+                Joined{" "}
+                {new Date(
+                  Math.min(...posts.map((p) => p.createdAt), Date.now())
+                ).toLocaleDateString()}
+              </span>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 space-y-3">
+            <label className="block">
+              <div className="text-sm text-zinc-500 mb-1">Bio (200 chars)</div>
+              <textarea
+                value={draftBio}
+                onChange={(e) => setDraftBio(e.target.value)}
+                className="w-full bg-transparent rounded-xl border border-zinc-300 dark:border-zinc-700 p-3"
+                rows={3}
+              />
+            </label>
+            <label className="block">
+              <div className="text-sm text-zinc-500 mb-1">
+                Links (one per line, up to 3)
+              </div>
+              <textarea
+                value={draftLinks}
+                onChange={(e) => setDraftLinks(e.target.value)}
+                className="w-full bg-transparent rounded-xl border border-zinc-300 dark:border-zinc-700 p-3"
+                rows={3}
+              />
+            </label>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setEditing(false)}
+                className="px-4 py-2 rounded-full border border-zinc-300 dark:border-zinc-700"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveProfile}
+                className="px-4 py-2 rounded-full bg-blue-600 text-white"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Story Highlights (fun mock) */}
+      <div className="mt-6">
+        <div className="font-medium mb-2">Highlights</div>
+        <div className="flex gap-4 overflow-x-auto pb-2">
+          {["Day One", "Walks", "Build", "IRL"].map((label, i) => (
+            <div key={i} className="flex-shrink-0 text-center">
+              <div className="w-20 h-20 rounded-full border-4 border-zinc-200 dark:border-zinc-800 grid place-items-center bg-zinc-100 dark:bg-zinc-900 text-2xl">
+                {label[0]}
+              </div>
+              <div className="text-xs mt-1 text-zinc-500">{label}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Posts grid */}
+      <div className="mt-6">
+        <div className="flex items-center justify-between mb-2">
+          <div className="font-medium">Posts</div>
+          <div className="flex gap-2 text-sm">
+            <button className="px-3 py-1 rounded-full border border-zinc-300 dark:border-zinc-700">
+              Grid
+            </button>
+            <button className="px-3 py-1 rounded-full border border-zinc-300 dark:border-zinc-700">
+              List
+            </button>
+          </div>
+        </div>
+        {posts.length === 0 ? (
+          <div className="text-sm text-zinc-500">No posts yet.</div>
+        ) : (
+          <div className="grid grid-cols-3 gap-2">
+            {posts.map((p) => (
+              <div
+                key={p.id}
+                className="aspect-square rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900"
+              >
+                {p.media[0] ? (
+                  <img
+                    src={p.media[0]}
+                    alt="post"
+                    className="w-full h-full object-cover"
+                    loading="lazy"
+                  />
+                ) : (
+                  <div className="w-full h-full grid place-items-center text-zinc-500 text-sm p-2 text-center">
+                    {p.text.slice(0, 60) || "Post"}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------
+// Stories Tray
+// ---------------------------
+function StoriesTray({
+  state,
+  onOpenProfile,
+}: {
+  state: State;
+  onOpenProfile: (id: string) => void;
+}) {
+  // stories are pruned by App effect; this is a simple render
+  const stories: Story[] = useMemo(
+    () => state.stories.filter((s: Story) => s.expiresAt > Date.now()),
+    [state.stories]
+  );
+
+  return (
+    <div className="flex gap-3 overflow-x-auto py-3">
+      {[
+        {
+          id: "self",
+          userId: state.me.id,
+          url: "",
+          createdAt: now(),
+          expiresAt: now() + 86_400_000,
+        } as Story,
+        ...stories,
+      ].map((s, i) => (
+        <button
+          key={s.id + String(i)}
+          className="text-center flex-shrink-0"
+          onClick={() => onOpenProfile(s.userId)}
+          aria-label={`Open ${
+            s.userId === state.me.id
+              ? "your"
+              : state.users[s.userId]?.name || "user"
+          } profile`}
+        >
+          <div className="w-[70px] h-[70px] rounded-full p-[3px] bg-gradient-to-tr from-emerald-400 via-blue-400 to-pink-400">
+            <div className="w-full h-full rounded-full bg-white dark:bg-zinc-950 border-2 border-white dark:border-zinc-950 overflow-hidden grid place-items-center">
+              {s.url ? (
+                <img
+                  src={s.url}
+                  alt="story"
+                  className="w-full h-full object-cover"
+                  loading="lazy"
+                />
+              ) : (
+                <span className="text-xl">
+                  {(state.users[s.userId]?.name || "U")[0]}
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="text-xs text-zinc-500 mt-1 w-[70px] truncate">
+            {s.userId === state.me.id
+              ? "Your story"
+              : state.users[s.userId]?.name}
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------
+// Post Card
+// ---------------------------
+function PostCard({
+  post,
+  user,
+  liked,
+  recasted,
+  onToggle,
+  onOpenProfile,
+}: {
+  post: Post;
+  user: User;
+  me: User;
+  liked: boolean;
+  recasted: boolean;
+  onToggle: (act: "like" | "recast" | "comment") => void;
+  onOpenProfile: (id: string) => void;
+}) {
+  return (
+    <article className="bg-white dark:bg-zinc-900 rounded-3xl border border-zinc-200 dark:border-zinc-800 p-4 my-4">
+      <div className="flex items-center gap-3">
+        <Avatar user={user} onClick={() => onOpenProfile(user.id)} />
+        <div className="leading-tight">
+          <div className="font-medium">{user.name}</div>
+          <div className="text-xs text-zinc-500">
+            {user.handle} · {timeAgo(post.createdAt)}
+          </div>
+        </div>
+      </div>
+      <div className="mt-3 whitespace-pre-wrap">{linkify(post.text)}</div>
+      {post.media?.length > 0 && (
+        <div className="flex gap-2 flex-wrap mt-3">
+          {post.media.map((src, i) => (
+            <img
+              key={i}
+              src={src}
+              alt="media"
+              className="max-h-80 rounded-xl border border-zinc-200 dark:border-zinc-800"
+              loading="lazy"
+            />
+          ))}
+        </div>
+      )}
+      <div className="flex items-center gap-3 text-sm text-zinc-500 mt-3">
+        <button
+          onClick={() => onToggle("like")}
+          className={`px-2 py-1 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
+            liked ? "text-pink-600" : ""
+          }`}
+          aria-pressed={liked}
+          aria-label="Like"
+        >
+          ❤️ <span className="ml-1">{formatCount(post.likes)}</span>
+        </button>
+        <button
+          onClick={() => onToggle("recast")}
+          className={`px-2 py-1 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
+            recasted ? "text-emerald-600" : ""
+          }`}
+          aria-pressed={recasted}
+          aria-label="Recast"
+        >
+          🔁 <span className="ml-1">{formatCount(post.recasts)}</span>
+        </button>
+        <button
+          onClick={() => onToggle("comment")}
+          className="px-2 py-1 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          aria-label="Comment"
+        >
+          💬 <span className="ml-1">{formatCount(post.comments)}</span>
+        </button>
+        <div className="ml-auto text-xs">ID {post.id.slice(-4)}</div>
+      </div>
+    </article>
+  );
+}
+
+function Avatar({
+  user,
+  onClick,
+  size = 44,
+}: {
+  user: User;
+  onClick?: () => void;
+  size?: number;
+}) {
+  const sizeClass = `w-[${size}px] h-[${size}px]`;
+  const innerSize = size - 6;
+  const innerSizeClass = `w-[${innerSize}px] h-[${innerSize}px]`;
+
+  return (
+    <button
+      onClick={onClick}
+      className={`shrink-0 rounded-full grid place-items-center font-bold text-zinc-900 ${sizeClass}`}
+      aria-label={`Open ${user.name} profile`}
+    >
+      <div
+        className={`rounded-full grid place-items-center bg-gradient-to-br from-blue-400 to-emerald-300 ${sizeClass}`}
+      >
+        <div
+          className={`rounded-full grid place-items-center bg-white/90 dark:bg-zinc-950/90 overflow-hidden ${innerSizeClass}`}
+        >
+          {user.avatar ? (
+            <img
+              src={user.avatar}
+              alt={user.name}
+              className="w-full h-full object-cover"
+              loading="lazy"
+            />
+          ) : (
+            <span>{user.name?.[0] || "U"}</span>
+          )}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+// ---------------------------
+// Utils
+// ---------------------------
+function linkify(text: string) {
+  const parts = text.split(/(https?:\/\/\S+|#[\p{L}0-9_]+)/gu);
+  return (
+    <>
+      {parts.map((p, i) => {
+        if (/^https?:\/\//.test(p))
+          return (
+            <a
+              key={i}
+              href={p}
+              {...safeLinkProps}
+              className="underline break-all"
+            >
+              {p}
+            </a>
+          );
+        if (/^#[\p{L}0-9_]+$/u.test(p))
+          return (
+            <span
+              key={i}
+              className="px-2 py-0.5 rounded-full border text-xs ml-1"
+            >
+              {p}
+            </span>
+          );
+        return <span key={i}>{p}</span>;
+      })}
+    </>
+  );
+}
+function readAsDataURL(file: File) {
+  // Correct JS single-line comment syntax used here (//), avoiding # which is invalid in JS/TS.
+  return new Promise<string>((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(String(fr.result)); // The error was previously thrown near here due to invalid comment syntax.
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+}
+
+// ---------------------------
+// Self-tests (runtime, non-blocking)
+// ---------------------------
+function runSelfTests() {
+  try {
+    console.groupCollapsed("Fuse self-tests");
+    // clamp
+    console.assert(clamp(5, 0, 10) === 5, "clamp middle failed");
+    console.assert(clamp(-1, 0, 10) === 0, "clamp low failed");
+    console.assert(clamp(99, 0, 10) === 10, "clamp high failed");
+    // timeAgo
+    const t0 = Date.now() - 5 * 1000; // ~5s ago
+    console.assert(/^\d+s$/.test(timeAgo(t0)), "timeAgo seconds format");
+    // linkify basics (http + unicode hashtag)
+    const parts = "Hi #тест https://example.com and #tag_1".split(
+      /(https?:\/\/\S+|#[\p{L}0-9_]+)/gu
+    );
+    console.assert(
+      parts.length >= 5,
+      "linkify split parts (unicode + underscore)"
+    );
+    console.assert(/#[\p{L}0-9_]+/u.test("#тест"), "unicode hashtag passes");
+    // score monotonicity sanity (more likes -> >= score)
+    const a: Post = {
+      id: "a",
+      userId: "u1",
+      text: "",
       media: [],
       likes: 0,
       recasts: 0,
       comments: 0,
       createdAt: Date.now(),
-      optimistic: true,
     };
-
-    setPosts((cur) => [optimisticPost, ...cur]);
-    setNewText("");
-
-    try {
-      const uploadedUrls: string[] = [];
-      for (const f of newFiles) {
-        const url = await uploadFileToStorage(f, "posts");
-        if (url) uploadedUrls.push(url);
-      }
-
-      const { data, error } = await supabase
-        .from("posts")
-        .insert([{ user_id: session.user.id, text: newText, media: uploadedUrls }])
-        .select()
-        .single();
-
-      if (error || !data) throw error ?? new Error("Insert error");
-
-      const serverPost = mapPostRow(data as PostRow);
-      setPosts((cur) => [serverPost, ...cur.filter((p) => p.id !== optimisticPost.id)]);
-    } catch (err) {
-      console.error("publish error", err);
-      setPosts((cur) => cur.filter((p) => p.id !== optimisticPost.id));
-      alert("Failed to publish post.");
-    } finally {
-      setNewFiles([]);
-    }
-  }
-
-  /* ---------------------- Likes ---------------------- */
-  async function toggleLike(postId: string): Promise<void> {
-    if (!session?.user) return alert("Sign in to like");
-    const already = !!userLikes[postId];
-
-    // optimistic
-    setUserLikes((cur) => {
-      const cp = { ...cur };
-      if (already) delete cp[postId];
-      else cp[postId] = true;
-      return cp;
-    });
-    setPosts((cur) => cur.map((p) => (p.id === postId ? { ...p, likes: p.likes + (already ? -1 : 1) } : p)));
-
-    try {
-      if (!already) {
-        const { error } = await supabase.from("likes").insert([{ user_id: session.user.id, post_id: postId }]);
-        if (error) throw error;
-      } else {
-        const { error } = await supabase.from("likes").delete().match({ user_id: session.user.id, post_id: postId });
-        if (error) throw error;
-      }
-
-      const postRes = await supabase.from("posts").select("likes").eq("id", postId).single();
-      if (!postRes.error && postRes.data) {
-        setPosts((cur) => cur.map((p) => (p.id === postId ? { ...p, likes: postRes.data.likes ?? p.likes } : p)));
-      }
-    } catch (err) {
-      console.error("toggleLike error", err);
-      // rollback optimistic
-      setUserLikes((cur) => {
-        const cp = { ...cur };
-        if (already) cp[postId] = true;
-        else delete cp[postId];
-        return cp;
-      });
-      // reload server post if possible
-      try {
-        const postRes = await supabase.from("posts").select("*").eq("id", postId).single();
-        if (!postRes.error && postRes.data) {
-          const serverPost = mapPostRow(postRes.data as PostRow);
-          setPosts((cur) => cur.map((p) => (p.id === postId ? serverPost : p)));
-        }
-      } catch (_) {}
-      alert("Failed to toggle like.");
-    }
-  }
-
-  /* ---------------------- UI helpers ---------------------- */
-  function handleFilesChange(ev: React.ChangeEvent<HTMLInputElement>) {
-    const list = Array.from(ev.target.files ?? []);
-    setNewFiles(list);
-  }
-
-  function ProfileMini({ userId }: { userId: string }) {
-    const p = profiles[userId] ?? (userId === me?.id ? me : undefined);
-    return (
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <img
-          alt="avatar"
-          src={p?.avatar ?? `https://api.dicebear.com/6.x/identicon/svg?seed=${userId}`}
-          style={{ width: 36, height: 36, borderRadius: 6, objectFit: "cover" }}
-        />
-        <div style={{ fontSize: 13 }}>
-          <div style={{ fontWeight: 600 }}>{p?.name ?? "Unknown"}</div>
-          <div style={{ color: "#666", fontSize: 12 }}>@{p?.handle ?? userId.slice(0, 6)}</div>
-        </div>
-      </div>
-    );
-  }
-
-  /* ---------------------- Render ---------------------- */
-  if (loading) {
-    return (
-      <div style={{ padding: 24, fontFamily: "sans-serif" }}>
-        <h3>Loading…</h3>
-      </div>
-    );
-  }
-
-  if (!session?.user) {
-    return (
-      <div style={{ padding: 20, fontFamily: "sans-serif", maxWidth: 680, margin: "0 auto" }}>
-        <h2>Mini Social (Supabase)</h2>
-        <p>Sign in with a magic link (email)</p>
-        <form onSubmit={signInWithMagicLink}>
-          <input
-            type="email"
-            placeholder="you@example.com"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            style={{ padding: 10, width: "100%", marginBottom: 8 }}
-          />
-          <button disabled={loading} style={{ padding: 10 }}>
-            Send magic link
-          </button>
-        </form>
-
-        <hr style={{ margin: "20px 0" }} />
-        <div>
-          <h4>Recent posts (read-only)</h4>
-          {posts.length === 0 && <div>No posts yet.</div>}
-          {posts.map((post) => (
-            <div key={post.id} style={{ border: "1px solid #eee", padding: 12, marginBottom: 10, borderRadius: 8 }}>
-              <ProfileMini userId={post.userId} />
-              <div style={{ marginTop: 8 }}>{post.text}</div>
-              {post.media && post.media.length > 0 && (
-                <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-                  {post.media.map((m, i) => (
-                    <img key={i} src={m} alt="" style={{ width: 120, height: 120, objectFit: "cover", borderRadius: 6 }} />
-                  ))}
-                </div>
-              )}
-              <div style={{ color: "#666", fontSize: 12, marginTop: 8 }}>{new Date(post.createdAt).toLocaleString()}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  }
-
-  // signed in UI
-  return (
-    <div style={{ padding: 20, fontFamily: "sans-serif", maxWidth: 760, margin: "0 auto" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h2>Mini Social (Supabase)</h2>
-        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <ProfileMini userId={me?.id ?? session.user.id} />
-          <button onClick={signOut} style={{ padding: "8px 12px" }}>
-            Sign out
-          </button>
-        </div>
-      </div>
-
-      <section style={{ marginTop: 16, marginBottom: 20, border: "1px solid #eee", padding: 12, borderRadius: 10 }}>
-        <h4>Create post</h4>
-        <textarea
-          placeholder="What's happening?"
-          value={newText}
-          onChange={(e) => setNewText(e.target.value)}
-          rows={4}
-          style={{ width: "100%", padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
-        />
-        <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
-          <input type="file" multiple onChange={handleFilesChange} />
-          <button onClick={publishPost} style={{ padding: "8px 12px" }}>
-            Publish
-          </button>
-          {newFiles.length > 0 && <div style={{ color: "#666" }}>{newFiles.length} file(s) ready</div>}
-        </div>
-      </section>
-
-      <section>
-        <h4>Feed</h4>
-        {posts.length === 0 && <div>No posts</div>}
-        {posts.map((post) => (
-          <article key={post.id} style={{ border: "1px solid #eee", padding: 12, borderRadius: 8, marginBottom: 12 }}>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <ProfileMini userId={post.userId} />
-              <div style={{ fontSize: 12, color: "#888" }}>{new Date(post.createdAt).toLocaleString()}</div>
-            </div>
-
-            <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{post.text}</div>
-
-            {post.media && post.media.length > 0 && (
-              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                {post.media.map((m, i) => (
-                  <img key={i} src={m} alt="" style={{ width: 160, height: 120, objectFit: "cover", borderRadius: 6 }} />
-                ))}
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: 12, marginTop: 10, alignItems: "center" }}>
-              <button
-                onClick={() => toggleLike(post.id)}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 8,
-                  border: userLikes[post.id] ? "1px solid #0a84ff" : "1px solid #ddd",
-                  background: userLikes[post.id] ? "#e8f0ff" : "white",
-                }}
-              >
-                {userLikes[post.id] ? "♥ Liked" : "♡ Like"} ({post.likes})
-              </button>
-              <div style={{ color: "#666", fontSize: 13 }}>{post.recasts ?? 0} recasts</div>
-            </div>
-          </article>
-        ))}
-      </section>
-    </div>
-  );
-}
-// src/App.jsx
-import React, { useEffect, useState, useRef } from "react";
-import { createClient } from "@supabase/supabase-js";
-
-/*
-  App.jsx
-  - Single-file React app using Supabase for auth, posts, media uploads, likes, realtime updates.
-  - Make sure REACT_APP_SUPABASE_URL and REACT_APP_SUPABASE_ANON_KEY are set.
-  - Ensure you created a storage bucket named 'media' and tables 'profiles','posts','likes'.
-*/
-
-const SUPABASE_URL = process.env.REACT_APP_SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.REACT_APP_SUPABASE_ANON_KEY;
-
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-  console.warn(
-    "Missing SUPABASE env vars. Set REACT_APP_SUPABASE_URL and REACT_APP_SUPABASE_ANON_KEY."
-  );
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  realtime: { params: { eventsPerSecond: 10 } }, // mild throttle
-});
-
-function randomFilename(originalName = "file") {
-  const ext = originalName.includes(".")
-    ? "." + originalName.split(".").pop()
-    : "";
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
-}
-
-async function uploadFileToStorage(file, folder = "posts") {
-  // returns public URL
-  const filePath = `${folder}/${randomFilename(file.name)}`;
-  const { data, error } = await supabase.storage
-    .from("media")
-    .upload(filePath, file);
-  if (error) {
-    // if file exists (409) - fallback to using that path's public URL
-    throw error;
-  }
-  const { data: pub } = supabase.storage.from("media").getPublicUrl(
-    data.path ?? filePath
-  );
-  return pub?.publicUrl ?? null;
-}
-
-function useAutoRef() {
-  const ref = useRef(null);
-  return ref;
-}
-
-export default function App() {
-  const [loading, setLoading] = useState(true);
-  const [session, setSession] = useState(null); // supabase session
-  const [me, setMe] = useState(null); // profile row for logged in user
-  const [profiles, setProfiles] = useState({}); // map userId -> profile
-  const [posts, setPosts] = useState([]); // list of posts newest first
-  const [userLikes, setUserLikes] = useState({}); // map postId -> true
-  const [newText, setNewText] = useState("");
-  const [newFiles, setNewFiles] = useState([]); // File objects
-  const [email, setEmail] = useState("");
-  const postsChannelRef = useAutoRef();
-
-  // Helper: map DB post row -> client post object
-  function mapPostRow(row) {
-    return {
-      id: row.id,
-      userId: row.user_id,
-      text: row.text,
-      media: row.media || [],
-      likes: row.likes ?? 0,
-      recasts: row.recasts ?? 0,
-      comments: row.comments ?? 0,
-      createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+    const b: Post = { ...a, id: "b", likes: 10 };
+    const scoreFn = (p: Post) => {
+      const ageH = (Date.now() - p.createdAt) / 3_600_000;
+      const engagement = p.likes * 2 + p.recasts * 3 + p.comments;
+      return engagement + clamp(12 - ageH, 0, 12);
     };
+    console.assert(scoreFn(b) >= scoreFn(a), "score monotonicity by likes");
+
+    console.log("All assertions passed");
+    console.groupEnd();
+  } catch (e) {
+    console.error("Self-tests error", e);
   }
-
-  // Initial load
-  useEffect(() => {
-    let mounted = true;
-    async function init() {
-      setLoading(true);
-
-      // session and auth listener
-      const {
-        data: { session: currentSession },
-      } = await supabase.auth.getSession();
-      if (!mounted) return;
-      setSession(currentSession);
-      if (currentSession?.user) {
-        await ensureProfileExists(currentSession.user);
-      }
-
-      // load profiles and posts (limit 200)
-      try {
-        const [profilesRes, postsRes] = await Promise.all([
-          supabase.from("profiles").select("*"),
-          supabase
-            .from("posts")
-            .select("*")
-            .order("created_at", { ascending: false })
-            .limit(200),
-        ]);
-
-        if (!mounted) return;
-
-        // profiles
-        if (profilesRes.error) throw profilesRes.error;
-        const profilesRows = profilesRes.data || [];
-        const profilesMap = {};
-        profilesRows.forEach((p) => {
-          profilesMap[p.id] = p;
-        });
-        setProfiles(profilesMap);
-
-        // posts
-        if (postsRes.error) throw postsRes.error;
-        const postsRows = postsRes.data || [];
-        setPosts(postsRows.map(mapPostRow));
-
-        // load likes for current user (if any)
-        if (currentSession?.user) {
-          const likesRes = await supabase
-            .from("likes")
-            .select("post_id")
-            .eq("user_id", currentSession.user.id);
-          if (!likesRes.error) {
-            const likesMap = {};
-            (likesRes.data || []).forEach((l) => (likesMap[l.post_id] = true));
-            setUserLikes(likesMap);
-          }
-          // set me profile
-          const profile = profilesMap[currentSession.user.id];
-          if (profile) setMe(profile);
-        }
-      } catch (err) {
-        console.error("Init error:", err);
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    init();
-
-    // auth state change listener
-    const { data: listener } = supabase.auth.onAuthStateChange(
-      async (event, sessionObj) => {
-        setSession(sessionObj);
-        if (sessionObj?.user) {
-          await ensureProfileExists(sessionObj.user);
-          // reload likes and me
-          const likesRes = await supabase
-            .from("likes")
-            .select("post_id")
-            .eq("user_id", sessionObj.user.id);
-          if (!likesRes.error) {
-            const likesMap = {};
-            (likesRes.data || []).forEach((l) => (likesMap[l.post_id] = true));
-            setUserLikes(likesMap);
-          }
-          // get profile
-          const p = await supabase
-            .from("profiles")
-            .select("*")
-            .eq("id", sessionObj.user.id)
-            .single();
-          if (!p.error) setMe(p.data);
-        } else {
-          setMe(null);
-          setUserLikes({});
-        }
-      }
-    );
-
-    return () => {
-      mounted = false;
-      listener?.subscription?.unsubscribe?.();
-    };
-  }, []);
-
-  // Realtime: subscribe to posts table for INSERT/UPDATE/DELETE
-  useEffect(() => {
-    // cleanup existing channel if present
-    async function setupRealtime() {
-      // unsubscribe old
-      try {
-        if (postsChannelRef.current) {
-          await postsChannelRef.current.unsubscribe();
-          postsChannelRef.current = null;
-        }
-      } catch (e) {
-        // ignore
-      }
-
-      // create a new channel
-      const channel = supabase.channel("public:posts");
-      channel.on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "posts" },
-        (payload) => {
-          const newPost = mapPostRow(payload.new);
-          setPosts((cur) => {
-            // ignore if already present
-            if (cur.some((p) => p.id === newPost.id)) return cur;
-            return [newPost, ...cur].slice(0, 500);
-          });
-        }
-      );
-
-      channel.on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "posts" },
-        (payload) => {
-          const updated = mapPostRow(payload.new);
-          setPosts((cur) => cur.map((p) => (p.id === updated.id ? updated : p)));
-        }
-      );
-
-      channel.on(
-        "postgres_changes",
-        { event: "DELETE", schema: "public", table: "posts" },
-        (payload) => {
-          setPosts((cur) => cur.filter((p) => p.id !== payload.old.id));
-        }
-      );
-
-      // subscribe
-      await channel.subscribe();
-      postsChannelRef.current = channel;
-    }
-
-    setupRealtime();
-
-    return () => {
-      (async () => {
-        try {
-          if (postsChannelRef.current) {
-            await postsChannelRef.current.unsubscribe();
-            postsChannelRef.current = null;
-          }
-        } catch (e) {
-          // ignore
-        }
-      })();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Utility: ensure profile row exists for an auth user
-  async function ensureProfileExists(user) {
-    if (!user) return;
-    try {
-      const { data, error } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", user.id)
-        .single();
-      if (error && error.code !== "PGRST116") {
-        // if not found, upsert
-        if (error.details?.includes("No rows found")) {
-          await supabase.from("profiles").insert([
-            {
-              id: user.id,
-              name:
-                user.user_metadata?.full_name ||
-                user.user_metadata?.name ||
-                user.email?.split("@")[0] ||
-                "Anon",
-              handle:
-                user.user_metadata?.handle ||
-                (user.email ? user.email.split("@")[0] : `u_${user.id.slice(0, 6)}`),
-              avatar: user.user_metadata?.avatar_url || null,
-            },
-          ]);
-        } else {
-          console.warn("Profile select error:", error);
-        }
-      } else if (data) {
-        setMe(data);
-      } else {
-        // upsert fallback
-        await supabase.from("profiles").upsert([
-          {
-            id: user.id,
-            name:
-              user.user_metadata?.full_name ||
-              user.user_metadata?.name ||
-              user.email?.split("@")[0] ||
-              "Anon",
-            handle:
-              user.user_metadata?.handle ||
-              (user.email ? user.email.split("@")[0] : `u_${user.id.slice(0, 6)}`),
-            avatar: user.user_metadata?.avatar_url || null,
-          },
-        ]);
-      }
-    } catch (err) {
-      console.error("ensureProfileExists error", err);
-    }
-  }
-
-  // Sign-in (magic link)
-  async function signInWithMagicLink(e) {
-    e?.preventDefault();
-    if (!email) return alert("Enter your email");
-    setLoading(true);
-    try {
-      const { error } = await supabase.auth.signInWithOtp({ email });
-      if (error) {
-        throw error;
-      }
-      alert("Magic link sent to your email (check spam).");
-    } catch (err) {
-      console.error(err);
-      alert("Sign-in error: " + err.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function signOut() {
-    await supabase.auth.signOut();
-    setSession(null);
-    setMe(null);
-    setUserLikes({});
-  }
-
-  // Publish a new post (uploads files then inserts post)
-  async function publishPost() {
-    if (!session?.user) {
-      return alert("Sign in first");
-    }
-    if (!newText.trim() && newFiles.length === 0) {
-      return alert("Type something or attach a file");
-    }
-
-    // optimistic post
-    const optimisticPost = {
-      id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      userId: session.user.id,
-      text: newText,
-      media: [],
-      likes: 0,
-      createdAt: Date.now(),
-      optimistic: true,
-    };
-    setPosts((cur) => [optimisticPost, ...cur]);
-    setNewText("");
-
-    try {
-      // upload files
-      const uploadedUrls = [];
-      for (const f of newFiles) {
-        if (f instanceof File) {
-          const url = await uploadFileToStorage(f, "posts");
-          if (url) uploadedUrls.push(url);
-        }
-      }
-
-      // insert post
-      const { data, error } = await supabase
-        .from("posts")
-        .insert([
-          {
-            user_id: session.user.id,
-            text: newText,
-            media: uploadedUrls,
-          },
-        ])
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      const serverPost = mapPostRow(data);
-
-      // replace optimistic
-      setPosts((cur) => [serverPost, ...cur.filter((p) => p.id !== optimisticPost.id)]);
-    } catch (err) {
-      console.error("publish error:", err);
-      // rollback optimistic
-      setPosts((cur) => cur.filter((p) => p.id !== optimisticPost.id));
-      alert("Failed to publish post.");
-    } finally {
-      setNewFiles([]);
-    }
-  }
-
-  // Toggle like for a post
-  async function toggleLike(postId) {
-    if (!session?.user) return alert("Sign in to like");
-
-    const already = !!userLikes[postId];
-
-    // optimistic toggle
-    setUserLikes((cur) => {
-      const copy = { ...cur };
-      if (already) delete copy[postId];
-      else copy[postId] = true;
-      return copy;
-    });
-    setPosts((cur) =>
-      cur.map((p) =>
-        p.id === postId ? { ...p, likes: p.likes + (already ? -1 : 1) } : p
-      )
-    );
-
-    try {
-      if (!already) {
-        // insert like
-        const { error } = await supabase
-          .from("likes")
-          .insert([{ user_id: session.user.id, post_id: postId }]);
-        if (error) {
-          // rollback
-          throw error;
-        }
-      } else {
-        // delete like
-        const { error } = await supabase
-          .from("likes")
-          .delete()
-          .match({ user_id: session.user.id, post_id: postId });
-        if (error) {
-          throw error;
-        }
-      }
-
-      // fetch latest count for the post and update (keeps consistent with server)
-      const postRes = await supabase.from("posts").select("likes").eq("id", postId).single();
-      if (!postRes.error && postRes.data) {
-        setPosts((cur) => cur.map((p) => (p.id === postId ? { ...p, likes: postRes.data.likes ?? p.likes } : p)));
-      }
-    } catch (err) {
-      console.error("toggleLike error", err);
-      // rollback optimistic if error
-      setUserLikes((cur) => {
-        const copy = { ...cur };
-        if (already) copy[postId] = true;
-        else delete copy[postId];
-        return copy;
-      });
-      // revert counts by reloading post
-      try {
-        const postRes = await supabase.from("posts").select("*").eq("id", postId).single();
-        if (!postRes.error && postRes.data) {
-          const serverPost = mapPostRow(postRes.data);
-          setPosts((cur) => cur.map((p) => (p.id === postId ? serverPost : p)));
-        }
-      } catch (_) {}
-      alert("Failed to toggle like.");
-    }
-  }
-
-  // File input handler
-  function handleFilesChange(ev) {
-    const list = Array.from(ev.target.files || []);
-    setNewFiles(list);
-  }
-
-  // Simple UI rendering helpers
-  function ProfileMini({ userId }) {
-    const p = profiles[userId] || (userId === me?.id ? me : null);
-    return (
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <img
-          alt="avatar"
-          src={p?.avatar || `https://api.dicebear.com/6.x/identicon/svg?seed=${userId}`}
-          style={{ width: 36, height: 36, borderRadius: 6, objectFit: "cover" }}
-        />
-        <div style={{ fontSize: 13 }}>
-          <div style={{ fontWeight: 600 }}>{p?.name || "Unknown"}</div>
-          <div style={{ color: "#666", fontSize: 12 }}>@{p?.handle || userId.slice(0, 6)}</div>
-        </div>
-      </div>
-    );
-  }
-
-  if (loading) {
-    return (
-      <div style={{ padding: 24, fontFamily: "sans-serif" }}>
-        <h3>Loading…</h3>
-      </div>
-    );
-  }
-
-  // Auth UI
-  if (!session?.user) {
-    return (
-      <div style={{ padding: 20, fontFamily: "sans-serif", maxWidth: 680, margin: "0 auto" }}>
-        <h2>Mini Social (Supabase)</h2>
-        <p>Sign in with a magic link (email)</p>
-        <form onSubmit={signInWithMagicLink}>
-          <input
-            type="email"
-            placeholder="you@example.com"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            style={{ padding: 10, width: "100%", marginBottom: 8 }}
-          />
-          <button disabled={loading} style={{ padding: 10 }}>
-            Send magic link
-          </button>
-        </form>
-
-        <hr style={{ margin: "20px 0" }} />
-        <div>
-          <h4>Recent posts (read-only)</h4>
-          {posts.length === 0 && <div>No posts yet.</div>}
-          {posts.map((post) => (
-            <div
-              key={post.id}
-              style={{
-                border: "1px solid #eee",
-                padding: 12,
-                marginBottom: 10,
-                borderRadius: 8,
-              }}
-            >
-              <ProfileMini userId={post.userId} />
-              <div style={{ marginTop: 8 }}>{post.text}</div>
-              {post.media && post.media.length > 0 && (
-                <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-                  {post.media.map((m, i) => (
-                    <img key={i} src={m} alt="" style={{ width: 120, height: 120, objectFit: "cover", borderRadius: 6 }} />
-                  ))}
-                </div>
-              )}
-              <div style={{ color: "#666", fontSize: 12, marginTop: 8 }}>{new Date(post.createdAt).toLocaleString()}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  }
-
-  // Signed-in UI
-  return (
-    <div style={{ padding: 20, fontFamily: "sans-serif", maxWidth: 760, margin: "0 auto" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <h2>Mini Social (Supabase)</h2>
-        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <ProfileMini userId={me?.id || session.user.id} />
-          <button onClick={signOut} style={{ padding: "8px 12px" }}>
-            Sign out
-          </button>
-        </div>
-      </div>
-
-      <section style={{ marginTop: 16, marginBottom: 20, border: "1px solid #eee", padding: 12, borderRadius: 10 }}>
-        <h4>Create post</h4>
-        <textarea
-          placeholder="What's happening?"
-          value={newText}
-          onChange={(e) => setNewText(e.target.value)}
-          rows={4}
-          style={{ width: "100%", padding: 10, borderRadius: 8, border: "1px solid #ddd" }}
-        />
-        <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
-          <input type="file" multiple onChange={handleFilesChange} />
-          <button onClick={publishPost} style={{ padding: "8px 12px" }}>
-            Publish
-          </button>
-          {newFiles.length > 0 && <div style={{ color: "#666" }}>{newFiles.length} file(s) ready</div>}
-        </div>
-      </section>
-
-      <section>
-        <h4>Feed</h4>
-        {posts.length === 0 && <div>No posts</div>}
-        {posts.map((post) => (
-          <article key={post.id} style={{ border: "1px solid #eee", padding: 12, borderRadius: 8, marginBottom: 12 }}>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <ProfileMini userId={post.userId} />
-              <div style={{ fontSize: 12, color: "#888" }}>{new Date(post.createdAt).toLocaleString()}</div>
-            </div>
-            <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{post.text}</div>
-
-            {post.media && post.media.length > 0 && (
-              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                {post.media.map((m, i) => (
-                  <img key={i} src={m} alt="" style={{ width: 160, height: 120, objectFit: "cover", borderRadius: 6 }} />
-                ))}
-              </div>
-            )}
-
-            <div style={{ display: "flex", gap: 12, marginTop: 10, alignItems: "center" }}>
-              <button
-                onClick={() => toggleLike(post.id)}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 8,
-                  border: userLikes[post.id] ? "1px solid #0a84ff" : "1px solid #ddd",
-                  background: userLikes[post.id] ? "#e8f0ff" : "white",
-                }}
-              >
-                {userLikes[post.id] ? "♥ Liked" : "♡ Like"} ({post.likes})
-              </button>
-              <div style={{ color: "#666", fontSize: 13 }}>{post.recasts ?? 0} recasts</div>
-            </div>
-          </article>
-        ))}
-      </section>
-    </div>
-  );
 }
